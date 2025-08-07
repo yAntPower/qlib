@@ -1,6 +1,6 @@
 # Binance加密货币数据收集器和智能交易系统
 
-本文档介绍如何使用Binance API为qlib构建完整的加密货币交易分析系统，包括数据收集、策略分析、实时信号生成和与Go交易程序的集成。
+本文档介绍如何使用Binance API为qlib构建完整的加密货币交易分析系统，包括数据收集、策略分析、实时信号生成和API服务提供。Go客户端集成请参考专门的okx_strategy项目。
 
 ## 🚀 核心特性
 
@@ -20,7 +20,7 @@
 ### 🔗 Go程序集成
 - **多种通信方式**: HTTP API、WebSocket、Redis、文件输出
 - **实时信号**: 毫秒级信号推送
-- **完整示例**: 包含仓位管理、风险控制的完整Go交易客户端
+- **API接口**: HTTP和WebSocket API供外部客户端集成
 - **模拟交易**: 支持纸上交易和实盘交易切换
 
 ## 🏗️ 系统架构和核心模块
@@ -31,7 +31,7 @@ qlib/scripts/data_collector/crypto/
 ├── binance_collector.py           # Binance数据收集器
 ├── binance_dump_bin.py           # 数据转换工具
 ├── binance_analyzer_starter.py   # 完整系统启动器
-├── binance_go_client_example.go  # 增强Go客户端示例
+├── ⚠️ Go客户端已移至okx_strategy项目 ⚠️
 ├── crypto_realtime_analyzer.py   # 实时分析器（复用现有）
 ├── go_communication.py          # Go通信接口（复用现有）
 ├── README_Binance.md            # 本文档
@@ -131,7 +131,7 @@ class GoTradingInterface:
     def export_signals_to_files()    # 文件输出
     def publish_to_redis_queue()     # Redis消息队列
     def send_webhook_notification()  # Webhook通知
-    def create_go_client_example()   # 生成Go代码
+    def get_client_integration_info() # 获取客户端集成信息
 ```
 
 **通信协议**:
@@ -141,7 +141,9 @@ class GoTradingInterface:
 - 📁 JSON/CSV文件输出
 - 🔔 Webhook回调
 
-### 6. Go客户端层 (`binance_go_client_example.go`)
+### 6. 客户端集成层
+
+**注意**: Go客户端代码已移至专门的okx_strategy项目，请参考该项目的文档
 
 **核心结构**:
 ```go
@@ -251,7 +253,7 @@ python binance_analyzer_starter.py full \
 # 1. 收集Binance历史数据
 # 2. 转换为qlib格式
 # 3. 启动实时分析系统
-# 4. 生成Go客户端代码
+# 4. 启动API服务（Go客户端请参考okx_strategy项目）
 # 5. 启动API服务器
 ```
 
@@ -267,15 +269,13 @@ curl http://localhost:8080/signals/latest
 curl http://localhost:8080/symbols
 ```
 
-### 4. 启动Go交易客户端
+### 4. 客户端集成
 ```bash
-# 编译并运行生成的Go客户端
-cd /tmp/binance_signals/
-go run binance_go_client.go
+# Go客户端代码已移至okx_strategy项目
+# 请参考该项目的安装和使用文档
+echo "请参考okx_strategy项目进行Go客户端集成"
 
-# 或者使用增强版客户端
-cd /path/to/qlib/scripts/data_collector/crypto/
-go run binance_go_client_example.go
+# Python API服务器正在运行，可供任何客户端集成
 ```
 
 ## 📋 详细使用说明
@@ -511,7 +511,9 @@ for message in pubsub.listen():
         print(f"收到信号: {signal_data}")
 ```
 
-## 🤖 Go客户端开发指南
+## 🤖 客户端集成指南
+
+**重要提示**: Go客户端代码已移至专门的okx_strategy项目中，提供更完整和专业的交易机器人实现。以下内容仅供API集成参考。
 
 ### 基础客户端结构
 ```go

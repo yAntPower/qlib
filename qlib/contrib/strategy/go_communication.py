@@ -447,167 +447,20 @@ class GoTradingInterface:
         logger.info(f"HTTP server thread started on port {self.http_port}")
         return server_thread
 
-    def create_go_client_example(self, output_file: str = None):
-        """创建Go客户端示例代码"""
-        go_code = '''package main
-
-import (
-    "encoding/json"
-    "fmt"
-    "io/ioutil"
-    "log"
-    "net/http"
-    "time"
-)
-
-// TradingSignal represents a trading signal from qlib
-type TradingSignal struct {
-    Symbol                string                 `json:"symbol"`
-    Timestamp            string                 `json:"timestamp"`
-    Price                float64                `json:"price"`
-    Volume               float64                `json:"volume"`
-    Recommendation       string                 `json:"recommendation"`
-    Confidence           float64                `json:"confidence"`
-    TechnicalIndicators  map[string]interface{} `json:"technical_indicators"`
-    MLPrediction         map[string]interface{} `json:"ml_prediction"`
-}
-
-// SignalResponse represents the API response
-type SignalResponse struct {
-    Status    string                    `json:"status"`
-    Timestamp string                    `json:"timestamp"`
-    Data      map[string]TradingSignal  `json:"data"`
-}
-
-// QlibClient handles communication with qlib analyzer
-type QlibClient struct {
-    BaseURL string
-    Client  *http.Client
-}
-
-// NewQlibClient creates a new client
-func NewQlibClient(baseURL string) *QlibClient {
-    return &QlibClient{
-        BaseURL: baseURL,
-        Client:  &http.Client{Timeout: 10 * time.Second},
-    }
-}
-
-// GetLatestSignals fetches the latest trading signals
-func (c *QlibClient) GetLatestSignals() (map[string]TradingSignal, error) {
-    resp, err := c.Client.Get(c.BaseURL + "/signals/latest")
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        return nil, err
-    }
-
-    var signalResp SignalResponse
-    if err := json.Unmarshal(body, &signalResp); err != nil {
-        return nil, err
-    }
-
-    if signalResp.Status != "success" {
-        return nil, fmt.Errorf("API error: %s", signalResp.Status)
-    }
-
-    return signalResp.Data, nil
-}
-
-// GetSignalsForSymbols fetches signals for specific symbols
-func (c *QlibClient) GetSignalsForSymbols(symbols []string) (map[string]TradingSignal, error) {
-    url := c.BaseURL + "/signals?symbols="
-    for i, symbol := range symbols {
-        if i > 0 {
-            url += ","
+    def get_client_integration_info(self):
+        """获取客户端集成信息"""
+        return {
+            "http_api_base": f"http://localhost:{self.http_port}",
+            "websocket_url": f"ws://localhost:8765",
+            "output_directory": str(self.output_dir),
+            "supported_endpoints": [
+                "GET /health - 健康检查", 
+                "GET /signals/latest - 获取最新信号",
+                "GET /signals?symbols=X,Y - 获取指定符号信号",
+                "POST /analyze - 触发分析"
+            ],
+            "integration_note": "Go客户端代码已移至专门的okx_strategy项目中，请参考该项目的文档"
         }
-        url += symbol
-    }
-
-    resp, err := c.Client.Get(url)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        return nil, err
-    }
-
-    var signalResp SignalResponse
-    if err := json.Unmarshal(body, &signalResp); err != nil {
-        return nil, err
-    }
-
-    return signalResp.Data, nil
-}
-
-// ProcessTradingSignals processes signals and makes trading decisions
-func ProcessTradingSignals(signals map[string]TradingSignal) {
-    for symbol, signal := range signals {
-        fmt.Printf("Processing %s: %s (confidence: %.2f)\\n", 
-            symbol, signal.Recommendation, signal.Confidence)
-        
-        // Your trading logic here
-        switch signal.Recommendation {
-        case "BUY":
-            if signal.Confidence > 0.7 {
-                fmt.Printf("  -> Executing BUY order for %s\\n", symbol)
-                // executeBuyOrder(symbol, signal)
-            } else {
-                fmt.Printf("  -> BUY signal confidence too low\\n")
-            }
-        case "SELL":
-            if signal.Confidence > 0.7 {
-                fmt.Printf("  -> Executing SELL order for %s\\n", symbol)
-                // executeSellOrder(symbol, signal)
-            } else {
-                fmt.Printf("  -> SELL signal confidence too low\\n")
-            }
-        case "HOLD":
-            fmt.Printf("  -> Holding position for %s\\n", symbol)
-        }
-    }
-}
-
-func main() {
-    // Initialize client
-    client := NewQlibClient("http://localhost:8080")
-    
-    // Example symbols to monitor
-    symbols := []string{"BTCUSDT", "ETHUSDT", "ADAUSDT"}
-    
-    // Main trading loop
-    for {
-        fmt.Println("Fetching latest signals...")
-        
-        signals, err := client.GetSignalsForSymbols(symbols)
-        if err != nil {
-            log.Printf("Error fetching signals: %v", err)
-            time.Sleep(30 * time.Second)
-            continue
-        }
-        
-        // Process signals
-        ProcessTradingSignals(signals)
-        
-        // Wait before next check
-        time.Sleep(30 * time.Second)
-    }
-}
-'''
-        
-        if output_file:
-            with open(output_file, 'w') as f:
-                f.write(go_code)
-            logger.info(f"Go client example saved to {output_file}")
-        
-        return go_code
 
 
 # 使用示例
@@ -634,10 +487,11 @@ if __name__ == "__main__":
     # 启动HTTP服务器
     go_interface.start_http_server_thread()
     
-    # 生成Go客户端示例
-    go_interface.create_go_client_example("/tmp/qlib_go_client.go")
+    # 获取客户端集成信息
+    client_info = go_interface.get_client_integration_info()
     
     print("Go communication interface is running...")
-    print(f"HTTP API: http://localhost:8080")
-    print(f"Signals output: /tmp/qlib_crypto_signals/")
-    print(f"Go client example: /tmp/qlib_go_client.go")
+    print(f"HTTP API: {client_info['http_api_base']}")
+    print(f"WebSocket: {client_info['websocket_url']}")
+    print(f"Signals output: {client_info['output_directory']}")
+    print(f"Note: {client_info['integration_note']}")

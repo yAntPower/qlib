@@ -224,10 +224,10 @@ class BinanceCryptoAnalysisSystem:
             # 设置Go通信接口
             self.setup_go_interface()
             
-            # 生成Go客户端代码
-            go_client_path = Path(self.output_dir) / "binance_go_client.go"
-            logger.info(f"生成Go客户端代码: {go_client_path}")
-            self.go_interface.create_go_client_example(str(go_client_path))
+            # 获取客户端集成信息
+            logger.info("获取客户端集成信息...")
+            client_info = self.go_interface.get_client_integration_info()
+            logger.info(f"客户端集成: {client_info['integration_note']}")
             
             # 启动HTTP服务器
             logger.info(f"启动HTTP API服务器 (端口 {self.http_port})...")

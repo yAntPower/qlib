@@ -47,9 +47,10 @@ def main():
             redis_config={"host": "localhost", "port": 6379, "db": 0},  # 可选
         )
         
-        # 3. 生成Go客户端代码
-        print(f"📝 生成Go客户端代码到: {GO_CLIENT_PATH}")
-        go_interface.create_go_client_example(GO_CLIENT_PATH)
+        # 3. 获取客户端集成信息
+        print("📝 获取客户端集成信息...")
+        client_info = go_interface.get_client_integration_info()
+        print(f"    {client_info['integration_note']}")
         
         # 4. 启动HTTP服务器
         print("🌐 启动HTTP API服务器 (端口 8080)...")
@@ -69,7 +70,7 @@ def main():
         print(f"📡 HTTP API: http://localhost:8080")
         print(f"🔌 WebSocket: ws://localhost:8765") 
         print(f"📁 信号输出目录: {OUTPUT_DIR}")
-        print(f"🐹 Go客户端代码: {GO_CLIENT_PATH}")
+        print(f"🐹 Go客户端: 请参考okx_strategy项目")
         print("\n📋 可用API端点:")
         print("  GET  /health          - 健康检查")
         print("  GET  /signals/latest  - 获取最新信号")
