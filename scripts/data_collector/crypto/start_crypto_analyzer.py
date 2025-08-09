@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-加密货币分析系统启动脚本
+通用加密货币分析系统启动脚本
 使用方法: python start_crypto_analyzer.py
+
+⚠️  重要提醒：
+推荐使用专用启动器以获得更好的体验：
+1. okx_integration_starter.py - OKX集成方案（最推荐）
+2. binance_analyzer_starter.py - Binance方案 
+3. start_crypto_analyzer.py - 通用兼容方案（本文件）
+
+本脚本为通用兼容模式，主要用于测试和向后兼容。
+兼容数据源：Binance（推荐OHLC）、TradingView（付费）、CoinGecko（仅价格）
 """
 
 import sys
@@ -20,10 +29,19 @@ def main():
     print("🚀 启动加密货币实时分析系统...")
     
     # 配置参数
-    DATA_PATH = "~/.qlib/qlib_data/crypto_data"  # 使用CoinGecko数据
-    # DATA_PATH = "~/.qlib/qlib_data/crypto_tv_data"  # 如果使用TradingView数据
+    # 推荐方案：使用okx_integration_starter.py 或 binance_analyzer_starter.py
+    # 以下配置为通用兼容模式，推荐使用专用启动器
     
-    SYMBOLS = ["bitcoin", "ethereum", "cardano", "polkadot"]  # CoinGecko符号格式
+    # 方案1: 使用Binance数据（推荐OHLC完整数据）
+    DATA_PATH = "~/.qlib/qlib_data/crypto_binance_data"  # 使用Binance数据
+    SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT"]  # Binance符号格式
+    
+    # 方案2: 使用CoinGecko数据（仅价格数据，回测受限）
+    # DATA_PATH = "~/.qlib/qlib_data/crypto_data"  # 使用CoinGecko数据
+    # SYMBOLS = ["bitcoin", "ethereum", "cardano", "polkadot"]  # CoinGecko符号格式
+    
+    # 方案3: 使用TradingView数据（需付费订阅）
+    # DATA_PATH = "~/.qlib/qlib_data/crypto_tv_data"  # 如果使用TradingView数据
     # SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT"]  # TradingView符号格式
     
     OUTPUT_DIR = "/tmp/qlib_crypto_signals"
