@@ -16,8 +16,21 @@ from typing import Iterable, Tuple, List
 import numpy as np
 import pandas as pd
 from loguru import logger
-from yahooquery import Ticker
+# from yahooquery import Ticker  # 屏蔽股票相关依赖
 from tqdm import tqdm
+
+# 临时替代 Ticker 类，避免导入错误
+class MockTicker:
+    def __init__(self, *args, **kwargs):
+        pass
+    def history(self, *args, **kwargs):
+        return pd.DataFrame()
+
+try:
+    from yahooquery import Ticker
+except ImportError:
+    logger.warning("yahooquery not available, using mock implementation for crypto-only mode")
+    Ticker = MockTicker
 from functools import partial
 from concurrent.futures import ProcessPoolExecutor
 from bs4 import BeautifulSoup

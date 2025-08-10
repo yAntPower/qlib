@@ -14,7 +14,22 @@ sys.path.append(str(CUR_DIR.parent.parent))
 from data_collector.base import BaseCollector, BaseNormalize, BaseRun
 from data_collector.utils import deco_retry
 
-from pycoingecko import CoinGeckoAPI
+# from pycoingecko import CoinGeckoAPI  # 屏蔽 CoinGecko 依赖，专注 Binance
+
+# 临时替代 CoinGeckoAPI 类
+class MockCoinGeckoAPI:
+    def get_coins_markets(self, vs_currency="usd"):
+        # 返回一些常见的加密货币，避免依赖 CoinGecko API
+        return [
+            {"id": "bitcoin"}, {"id": "ethereum"}, {"id": "binancecoin"},
+            {"id": "cardano"}, {"id": "solana"}, {"id": "polkadot"}
+        ]
+
+try:
+    from pycoingecko import CoinGeckoAPI
+except ImportError:
+    logger.warning("pycoingecko not available, using mock implementation for crypto-only mode")
+    CoinGeckoAPI = MockCoinGeckoAPI
 from time import mktime
 from datetime import datetime as dt
 import time
