@@ -394,13 +394,22 @@ class EnhancedBinanceAnalyzer:
             volume_ratio = indicators.get('volume_ratio', 1)
             
             # 多因子分析
-            # 1. RSI 信号
-            if rsi < 30:
+            # 1. RSI 信号 - 修复更精确的RSI判断逻辑
+            if rsi < 25:
+                score += 3
+                reasons.append("RSI极度超卖")
+            elif rsi < 35:
                 score += 2
                 reasons.append("RSI超卖")
-            elif rsi > 70:
+            elif rsi > 75:
+                score -= 3
+                reasons.append("RSI极度超买")
+            elif rsi > 65:
                 score -= 2
-                reasons.append("RSI超买")
+                reasons.append("RSI接近超买")
+            elif rsi > 55 and rsi < 65:
+                score -= 1
+                reasons.append("RSI偏高")
             
             # 2. 移动平均线趋势
             if price > ma5 > ma20 > ma50:
@@ -448,6 +457,11 @@ class EnhancedBinanceAnalyzer:
                 elif score < 0:
                     score -= 1
                     reasons.append("成交量放大确认")
+            
+            # 7. 市场过热检测 - 新增
+            if rsi > 60 and price > ma5 and volume_ratio < 1.2:
+                score -= 1
+                reasons.append("市场过热缺乏成交量支撑")
             
             # 加入市场动态性和随机因素
             import random
@@ -513,28 +527,28 @@ class EnhancedBinanceAnalyzer:
             final_confidence = (base_confidence + volatility_bonus) * coin_factor
             final_confidence = max(0.50, min(0.90, final_confidence))
             
-            # 生成最终信号 - 基于真实技术分析阈值
-            if adjusted_score >= 3.0:
+            # 生成最终信号 - 更严格的阈值设置
+            if adjusted_score >= 2.5:
                 recommendation = "BUY"
                 confidence = max(0.75, final_confidence)
-            elif adjusted_score <= -3.0:
+            elif adjusted_score <= -2.0:  # 更容易触发SELL
                 recommendation = "SELL" 
                 confidence = max(0.75, final_confidence)
-            elif adjusted_score >= 1.5:
+            elif adjusted_score >= 1.0:
                 recommendation = "BUY"
                 confidence = max(0.65, final_confidence * 0.95)
-            elif adjusted_score <= -1.5:
+            elif adjusted_score <= -1.0:  # 更容易触发SELL
                 recommendation = "SELL"
                 confidence = max(0.65, final_confidence * 0.95)
-            elif adjusted_score >= 0.5:
+            elif adjusted_score >= 0.2:
                 recommendation = "BUY"
                 confidence = max(0.55, final_confidence * 0.9)
-            elif adjusted_score <= -0.5:
+            elif adjusted_score <= -0.3:  # 更容易触发SELL
                 recommendation = "SELL"
                 confidence = max(0.55, final_confidence * 0.9)
             else:
                 recommendation = "HOLD"
-                confidence = 0.50  # 移除HOLD状态的随机性
+                confidence = 0.50
             
             return {
                 'symbol': symbol,
