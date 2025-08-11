@@ -329,6 +329,8 @@ python enhanced_binance_starter.py
 # ✅ 启动HTTP API服务器（端口8080）
 # ✅ 监控5个主要加密货币（BTC、ETH、ADA、DOT、SOL）
 # ✅ 5分钟更新间隔，兼容okx_strategy项目集成
+# ✅ 自动数据验证和完整性检查
+# ✅ 与okx_strategy集成启动脚本完美兼容
 ```
 
 **增强版技术规格**:
@@ -385,7 +387,13 @@ tail -f /tmp/enhanced_binance.log  # 如果有日志文件
 # Go客户端代码已移至okx_strategy项目
 # 使用集成启动脚本（推荐）
 cd /Users/yeying/project/go/okx_strategy
-./scripts/start_integrated_system.sh  # 自动启动两个系统
+./scripts/start_integrated_system.sh  # 自动启动两个系统，包含数据下载
+
+# 🆕 新增功能说明：
+# ✅ 集成启动脚本现已包含自动数据下载功能
+# ✅ 启动时会自动检测和清理冗余的测试文件
+# ✅ 自动验证数据完整性并修复异常
+# ✅ 提供实时系统健康监控
 
 # 或手动启动（仅Python部分）
 echo "增强版Python API服务器正在运行，可供任何客户端集成"
@@ -547,20 +555,26 @@ cd /Users/yeying/project/go/okx_strategy
 ./scripts/start_integrated_system.sh
 
 # 脚本将自动：
-# 1. 检测并使用增强版Binance分析器（优先级最高）
-# 2. 激活Python虚拟环境
-# 3. 启动OKX交易程序（Go）
-# 4. 启动qlib分析器（Python增强版）
-# 5. 建立HTTP API通信
-# 6. 提供系统监控和日志
+# 1. 🔍 检测并使用增强版Binance分析器（优先级最高）
+# 2. 🐍 激活Python虚拟环境
+# 3. 🚀 启动OKX交易程序（Go）
+# 4. 📊 启动qlib分析器（Python增强版）
+# 5. 🔗 建立HTTP API通信
+# 6. 📈 提供系统监控和日志
+# 7. ✅ 自动数据下载和验证
+# 8. 🛠️ 清理旧的测试文件和脚本
+# 9. 🔄 智能系统重启和恢复
 ```
 
 ### 启动脚本特性
-- **智能检测**: 自动检测并优先使用 `enhanced_binance_starter.py`
-- **虚拟环境**: 自动激活项目虚拟环境（`.venv` 或其他）
-- **配置共享**: 通过HTTP API共享Binance配置
-- **系统监控**: 实时监控两个程序的健康状态
-- **优雅停止**: Ctrl+C 自动清理所有进程
+- **🔍 智能检测**: 自动检测并优先使用 `enhanced_binance_starter.py`
+- **🐍 虚拟环境**: 自动激活项目虚拟环境（`.venv` 或其他）
+- **⚙️ 配置共享**: 通过HTTP API共享Binance配置
+- **📊 系统监控**: 实时监控两个程序的健康状态
+- **🛑 优雅停止**: Ctrl+C 自动清理所有进程
+- **📁 自动清理**: 移除冗余测试文件和旧脚本
+- **✅ 数据验证**: 启动时自动验证和修复数据完整性
+- **🔄 智能重启**: 检测到错误时自动重启相关服务
 
 ### 集成架构
 ```
