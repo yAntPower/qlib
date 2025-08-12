@@ -1097,7 +1097,39 @@ class PriceAlertSystem:
 
 ## 📝 系统更新日志
 
-### v3.2.0 - 2024年8月 (最新)
+### v3.2.1 - 2025年8月13日 (最新)
+
+#### 🔧 生产环境关键修复
+
+**字段映射修复**
+- 修正API响应字段名：`indicators` → `technical_indicators`
+- 确保包含`volume`字段在响应中
+- 文件：`enhanced_binance_starter.py` 第538-560行
+
+**随机因素移除**
+- 移除所有`random.uniform()`调用
+- 移除时间相关的动态因素`math.sin(time.time())`
+- 改为基于实际市场数据的确定性计算
+- 文件：`enhanced_binance_starter.py` 第466-536行
+
+**生产环境配置建议**
+```python
+# enhanced_binance_starter.py 关键配置
+response = {
+    "status": "success",
+    "timestamp": datetime.now().isoformat(),
+    "data": signals  # 包含technical_indicators字段
+}
+```
+
+**依赖和环境**
+```bash
+# 使用项目虚拟环境
+source /home/ant/project/.venv/bin/activate
+# 必需包：pandas, numpy, requests
+```
+
+### v3.2.0 - 2024年8月
 
 #### 🚀 OKX集成系统重大升级
 

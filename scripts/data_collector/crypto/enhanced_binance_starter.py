@@ -458,17 +458,12 @@ class EnhancedBinanceAnalyzer:
                     score -= 1
                     reasons.append("成交量放大确认")
             
-            # 7. 市场过热检测 - 新增
+            # 7. 市场过热检测
             if rsi > 60 and price > ma5 and volume_ratio < 1.2:
                 score -= 1
                 reasons.append("市场过热缺乏成交量支撑")
             
-            # 加入市场动态性和随机因素
-            import random
-            import math
-            import time
-            
-            # 计算价格波动率和动量
+            # 计算价格动量（不使用随机因素）
             if len(df) >= 24:
                 recent_prices = df['close'].tail(24)
                 volatility = recent_prices.std() / recent_prices.mean()
@@ -477,30 +472,18 @@ class EnhancedBinanceAnalyzer:
                 volatility = 0.02
                 price_momentum = 0
             
-            # 时间和市场情绪因子
-            time_factor = math.sin(time.time() / 3600) * 0.15  # 周期性市场情绪
-            momentum_factor = max(-0.3, min(0.3, price_momentum * 5))
+            # 动量因子调整（移除随机性）
+            momentum_factor = max(-0.3, min(0.3, price_momentum * 3))  # 基于实际动量，不随机
             
-            # 动态调整评分
-            adjusted_score = score + time_factor + momentum_factor + random.uniform(-0.5, 0.5)
+            # 最终评分（不加随机因素）
+            final_score = score + momentum_factor
             
-            # 不同币种的个性化调整
-            if symbol == "BTCUSDT":
-                coin_factor = random.uniform(0.6, 0.7)  # BTC相对保守
-            elif symbol == "ETHUSDT": 
-                coin_factor = random.uniform(0.6, 0.75)  # ETH略微激进
-            elif symbol == "SUIUSDT":
-                coin_factor = random.uniform(0.7, 0.85)  # SUI较为激进
-            elif symbol == "SOLUSDT":
-                coin_factor = random.uniform(0.7, 0.8)   # SOL中等激进
-            else:
-                coin_factor = random.uniform(0.65, 0.8)  # 其他币种
-            
-            # 修复动态置信度计算 - 移除过度随机化
-            # 基础置信度基于评分强度
-            score_strength = abs(adjusted_score)
+            # 基础置信度基于评分强度（确定性计算）
+            score_strength = abs(final_score)
             if score_strength >= 4:
                 base_confidence = 0.85  # 强信号
+            elif score_strength >= 3:
+                base_confidence = 0.80  # 较强信号
             elif score_strength >= 2:
                 base_confidence = 0.75  # 中强信号
             elif score_strength >= 1:
@@ -508,44 +491,46 @@ class EnhancedBinanceAnalyzer:
             else:
                 base_confidence = 0.55  # 弱信号
             
-            # 波动率调整（减少随机性）
-            volatility_bonus = min(0.05, volatility * 2)  # 降低波动率影响
+            # 波动率调整（确定性计算）
+            volatility_adjustment = min(0.05, volatility * 2)
             
-            # 币种特性调整（减少随机性）
+            # 币种特性调整（固定值，无随机性）
             if symbol == "BTCUSDT":
-                coin_factor = 0.95  # BTC相对稳定
+                coin_factor = 0.95  # BTC相对保守
             elif symbol == "ETHUSDT": 
-                coin_factor = 0.98  # ETH略微激进
+                coin_factor = 0.98  # ETH标准
             elif symbol == "SUIUSDT":
                 coin_factor = 1.02  # SUI较为激进
             elif symbol == "SOLUSDT":
-                coin_factor = 1.00   # SOL标准
+                coin_factor = 1.00  # SOL标准
+            elif symbol in ["ADAUSDT", "DOTUSDT"]:
+                coin_factor = 0.98  # ADA/DOT偏保守
             else:
-                coin_factor = 0.97  # 其他币种偏保守
+                coin_factor = 0.97  # 其他币种保守
             
-            # 最终置信度（大幅减少随机性）
-            final_confidence = (base_confidence + volatility_bonus) * coin_factor
+            # 最终置信度（确定性计算）
+            final_confidence = (base_confidence + volatility_adjustment) * coin_factor
             final_confidence = max(0.50, min(0.90, final_confidence))
             
-            # 生成最终信号 - 更严格的阈值设置
-            if adjusted_score >= 2.5:
+            # 生成最终信号（基于确定的阈值）
+            if final_score >= 3:
                 recommendation = "BUY"
-                confidence = max(0.75, final_confidence)
-            elif adjusted_score <= -2.0:  # 更容易触发SELL
+                confidence = min(0.85, final_confidence)
+            elif final_score <= -3:
                 recommendation = "SELL" 
-                confidence = max(0.75, final_confidence)
-            elif adjusted_score >= 1.0:
+                confidence = min(0.85, final_confidence)
+            elif final_score >= 1.5:
                 recommendation = "BUY"
-                confidence = max(0.65, final_confidence * 0.95)
-            elif adjusted_score <= -1.0:  # 更容易触发SELL
+                confidence = min(0.75, final_confidence)
+            elif final_score <= -1.5:
                 recommendation = "SELL"
-                confidence = max(0.65, final_confidence * 0.95)
-            elif adjusted_score >= 0.2:
+                confidence = min(0.75, final_confidence)
+            elif final_score >= 0.5:
                 recommendation = "BUY"
-                confidence = max(0.55, final_confidence * 0.9)
-            elif adjusted_score <= -0.3:  # 更容易触发SELL
+                confidence = min(0.65, final_confidence)
+            elif final_score <= -0.5:
                 recommendation = "SELL"
-                confidence = max(0.55, final_confidence * 0.9)
+                confidence = min(0.65, final_confidence)
             else:
                 recommendation = "HOLD"
                 confidence = 0.50
@@ -556,9 +541,10 @@ class EnhancedBinanceAnalyzer:
                 'recommendation': recommendation,
                 'confidence': confidence,
                 'price': price,
-                'score': score,
+                'volume': indicators.get('volume', 0),
+                'score': final_score,
                 'reasons': reasons,
-                'indicators': indicators
+                'technical_indicators': indicators
             }
             
         except Exception as e:
@@ -571,14 +557,20 @@ class EnhancedBinanceAnalyzer:
             signal = self.generate_enhanced_signal(symbol)
             if signal:
                 self.signals[symbol] = signal
-                logger.info(f"{symbol}: {signal['recommendation']} (置信度: {signal['confidence']:.2f}, 评分: {signal['score']}, RSI: {signal['indicators'].get('rsi', 'N/A'):.1f})")
+                logger.info(f"{symbol}: {signal['recommendation']} (置信度: {signal['confidence']:.2f}, 评分: {signal['score']}, RSI: {signal['technical_indicators'].get('rsi', 'N/A'):.1f})")
 
 # HTTP 处理器保持不变
 class EnhancedBinanceHTTPHandler(BaseHTTPRequestHandler):
     """HTTP API 处理器"""
     
     def do_GET(self):
-        if self.path == '/health':
+        from urllib.parse import urlparse, parse_qs
+        
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        query_params = parse_qs(parsed_path.query)
+        
+        if path == '/health':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -589,15 +581,58 @@ class EnhancedBinanceHTTPHandler(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(response).encode())
             
-        elif self.path == '/signals/latest':
+        elif path == '/signals/latest' or path == '/signals':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             analyzer = getattr(self.server, 'analyzer', None)
             if analyzer:
-                self.wfile.write(json.dumps(analyzer.signals).encode())
+                signals = analyzer.signals.copy()
+                
+                # 如果有symbols参数，过滤信号
+                if 'symbols' in query_params:
+                    symbols_param = query_params['symbols'][0]
+                    requested_symbols = [s.strip() for s in symbols_param.split(',')]
+                    
+                    # 转换OKX符号到Binance符号
+                    symbol_mapping = {
+                        'BTC-USDT-SWAP': 'BTCUSDT',
+                        'ETH-USDT-SWAP': 'ETHUSDT', 
+                        'SUI-USDT-SWAP': 'SUIUSDT',
+                        'SOL-USDT-SWAP': 'SOLUSDT',
+                        'ADA-USDT-SWAP': 'ADAUSDT'
+                    }
+                    
+                    binance_symbols = []
+                    for okx_symbol in requested_symbols:
+                        if okx_symbol in symbol_mapping:
+                            binance_symbols.append(symbol_mapping[okx_symbol])
+                        else:
+                            binance_symbols.append(okx_symbol)  # 保持原样
+                    
+                    # 过滤信号
+                    filtered_signals = {}
+                    for symbol in binance_symbols:
+                        if symbol in signals:
+                            filtered_signals[symbol] = signals[symbol]
+                    
+                    signals = filtered_signals
+                
+                # 包装成OKX期待的格式
+                response = {
+                    "status": "success",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": signals
+                }
+                self.wfile.write(json.dumps(response).encode())
             else:
-                self.wfile.write(json.dumps({"error": "No signals available"}).encode())
+                response = {
+                    "status": "error",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {},
+                    "error": "No signals available"
+                }
+                self.wfile.write(json.dumps(response).encode())
         else:
             self.send_response(404)
             self.end_headers()
