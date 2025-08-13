@@ -133,8 +133,8 @@ class EnhancedProductionML:
             
             # 风控参数
             'max_position_pct': 0.2,  # 最大仓位20%
-            'stop_loss': 0.02,  # 止损2%
-            'take_profit': 0.05,  # 止盈5%
+            'stop_loss': 0.03,  # 止损3%
+            'take_profit': 0.08,  # 止盈8%
             'min_confidence': 0.6,  # 最小置信度
         }
         
