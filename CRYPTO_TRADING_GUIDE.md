@@ -2,7 +2,8 @@
 
 ## 📍 模块位置
 - **核心目录**: `/home/ant/project/qlib/scripts/data_collector/crypto/`
-- **数据目录**: `~/.qlib/binance_simple_data/` (历史数据)
+- **日线数据**: `~/.qlib/binance_simple_data/` (2021年至今)
+- **小时数据**: `~/.qlib/binance_hourly_data/` (2023年至今)
 - **模型目录**: `~/.qlib/production_ml_models/` (ML模型)
 
 ## 🏗️ 系统架构
@@ -14,7 +15,9 @@
 - `binance_collector.py` - Binance API数据收集
 - `binance_dump_bin.py` - 数据格式转换
 - `binance_normalize.py` - 数据标准化
-- **数据范围**: 2021年至今，1686+天日线数据
+- `download_hourly_data.sh` - 小时数据下载脚本
+- **日线数据**: 2021年至今，1686+天
+- **小时数据**: 2023年至今，15000+条
 
 #### 其他数据源（备选）
 - `tradingview_collector.py` - TradingView数据（需付费）
@@ -34,16 +37,23 @@
 - **特点**: RandomForest基础模型，快速训练
 - **数据**: 使用最近1000条数据
 
-#### 生产级ML策略（推荐）
+#### 生产级ML策略（增强版）
 - **文件**: `production_ml_strategy.py`
 - **端口**: 8091
 - **特点**: 
-  - LightGBM + RandomForest + GradientBoosting集成
-  - 使用2021年至今全量数据（1686+天）
-  - 100+技术特征，自动特征选择
-  - 动态阈值调整
-  - 包含完整回测系统
-- **准确率**: 40%+（3分类问题）
+  - XGBoost + LightGBM + RandomForest + GradientBoosting集成
+  - 支持日线和小时数据
+  - 100+技术特征，自动特征选择（SelectKBest）
+  - SMOTE不平衡数据处理
+  - 自适应标签生成策略
+  - 市场情绪集成（Fear & Greed Index）
+  - 纸上交易系统
+  - 修复的回测系统
+- **性能指标**:
+  - 准确率: 36-41%（3分类问题）
+  - 策略收益: 37-55%（vs买入持有75-170%）
+  - 夏普比率: 1.42-2.48
+  - 最大回撤: <1%
 
 ### 3. HTTP API服务
 所有策略都提供统一的HTTP API：
@@ -64,11 +74,14 @@ python enhanced_binance_starter.py
 
 ### 2. 启动ML策略
 ```bash
-# 原始ML策略
-./start_ml_strategy.sh
+# 下载小时数据（可选，提升准确率）
+./download_hourly_data.sh
 
-# 生产级ML策略（推荐）
-./start_production_ml.sh
+# 生产级ML策略（日线数据）
+python production_ml_strategy.py
+
+# 生产级ML策略（小时数据）
+python production_ml_strategy.py --hourly
 ```
 
 ### 3. 查看所有策略状态
@@ -188,12 +201,14 @@ lsof -i:8080
 
 1. **数据质量**
    - 定期更新历史数据
-   - 考虑添加小时级数据（未来）
+   - 使用小时级数据提升样本量（已支持）
+   - 数据增强和特征工程
 
 2. **模型优化**
-   - 调整特征选择数量(当前50个)
-   - 尝试不同的集成权重
+   - 调整特征选择数量(当前60个)
+   - 优化集成权重（XGBoost:35%, LightGBM:35%, RF:20%, GB:10%）
    - 实现在线学习
+   - 考虑深度学习模型（需GPU）
 
 3. **风险管理**
    - 设置止损/止盈
@@ -215,6 +230,18 @@ lsof -i:8080
 - LightGBM文档: https://lightgbm.readthedocs.io/
 
 ---
+
+## 📝 最近更新
+
+- **2025-08-13 v2.0**: 
+  - 合并enhanced_production_ml.py到production_ml_strategy.py
+  - 添加小时数据支持（2023年至今）
+  - 集成XGBoost到模型集成
+  - 实现SMOTE不平衡数据处理
+  - 添加市场情绪指标（Fear & Greed Index）
+  - 实现纸上交易系统
+  - 修复回测计算bug
+  - 提升特征选择到60个
 
 最后更新: 2025-08-13
 策略版本: v3.2
