@@ -83,7 +83,8 @@ class EnhancedProductionML:
                  hourly_data_dir: str = "~/.qlib/binance_hourly_data",
                  model_dir: str = "~/.qlib/production_ml_models",
                  symbols: Optional[List[str]] = None,
-                 use_hourly_data: bool = False):
+                 use_hourly_data: bool = False,
+                 enable_auto_retrain: bool = True):
         """
         初始化增强版ML策略
         """
@@ -92,8 +93,34 @@ class EnhancedProductionML:
         self.hourly_data_dir = os.path.expanduser(hourly_data_dir)
         self.model_dir = os.path.expanduser(model_dir)
         
-        # 默认交易对
-        self.symbols = symbols or ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+        # 从环境变量读取交易对，如果没有则使用默认值
+        if symbols:
+            self.symbols = symbols
+        else:
+            # 从环境变量读取，支持多种格式
+            env_symbols = os.getenv('QLIB_WATCH_SYMBOLS', '')
+            if not env_symbols:
+                env_symbols = os.getenv('STRATEGY_SYMBOLS', '')
+            
+            if env_symbols:
+                # 处理OKX格式（BTC-USDT-SWAP）转换为Binance格式（BTCUSDT）
+                symbols_list = []
+                for symbol in env_symbols.split(','):
+                    symbol = symbol.strip()
+                    # 转换 XXX-USDT-SWAP 为 XXXUSDT
+                    if '-USDT-SWAP' in symbol:
+                        symbol = symbol.replace('-USDT-SWAP', 'USDT')
+                        symbol = symbol.replace('-', '')
+                    # 确保是USDT结尾
+                    if not symbol.endswith('USDT'):
+                        symbol = symbol + 'USDT'
+                    symbols_list.append(symbol)
+                self.symbols = symbols_list
+                logger.info(f"从环境变量加载交易对: {self.symbols}")
+            else:
+                # 使用默认值
+                self.symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'ADAUSDT']
+                logger.info(f"使用默认交易对: {self.symbols}")
         
         # 模型配置
         self.models = {}
@@ -109,9 +136,19 @@ class EnhancedProductionML:
         # 市场情绪数据
         self.sentiment_data = {}
         
+        # 数据缓存(避免重复加载)
+        self._data_cache = {}
+        self._cache_timestamp = {}
+        
+        # 训练锁 - 避免训练时与策略执行冲突
+        self._training_lock = threading.RLock()
+        self._is_training = False
+        self.enable_auto_retrain = enable_auto_retrain
+        self._last_retrain_date = None
+        
         # 参数配置
         self.config = {
-            'min_data_points': 1000,  # 增加最少数据点
+            'min_data_points': 500,  # 降低要求以支持新币种如SUI
             'test_size': 0.2,
             'n_features': 60,  # 增加特征数量
             'prediction_horizon': 1,
@@ -150,8 +187,86 @@ class EnhancedProductionML:
         
         logger.info(f"增强版ML策略初始化完成")
     
+    def _ensure_data_availability(self):
+        """确保所有币种的历史数据可用，如果缺失则自动下载"""
+        for symbol in self.symbols:
+            data_path = os.path.join(self.data_dir, f"{symbol}.csv")
+            if not os.path.exists(data_path):
+                logger.info(f"检测到 {symbol} 历史数据缺失，开始自动下载...")
+                if self._download_symbol_data(symbol):
+                    logger.info(f"✅ {symbol} 历史数据下载成功")
+                else:
+                    logger.warning(f"❌ {symbol} 历史数据下载失败，该币种将被跳过")
+                    
+    def _download_symbol_data(self, symbol: str) -> bool:
+        """下载指定币种的历史数据"""
+        try:
+            import requests
+            
+            # 特殊处理新币种的上线时间
+            start_dates = {
+                'SUIUSDT': '2023-05-03',  # SUI 2023年5月上线
+                'APTUSDT': '2022-10-19',  # APT 2022年10月上线
+                'ARBUSDT': '2023-03-23',  # ARB 2023年3月上线
+                'OPUSDT': '2022-06-01',   # OP 2022年6月上线
+            }
+            
+            start_date = start_dates.get(symbol, '2020-01-01')
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                'symbol': symbol,
+                'interval': '1d',
+                'startTime': int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000),
+                'endTime': int(datetime.now().timestamp() * 1000),
+                'limit': 1000
+            }
+            
+            # 使用代理
+            proxies = {}
+            http_proxy = os.environ.get('http_proxy')
+            if http_proxy:
+                proxies = {'http': http_proxy, 'https': http_proxy}
+            
+            response = requests.get(url, params=params, proxies=proxies, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data:
+                df = pd.DataFrame(data, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                    'taker_buy_quote', 'ignore'
+                ])
+                
+                df['date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.strftime('%Y-%m-%d')
+                df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
+                
+                # 转换为float
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                
+                # 保存到数据目录
+                save_path = os.path.join(self.data_dir, f"{symbol}.csv")
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                df.to_csv(save_path, index=False)
+                
+                logger.info(f"{symbol} 数据下载成功，共{len(df)}条记录")
+                return True
+            else:
+                logger.warning(f"{symbol} 没有获取到数据")
+                return False
+                
+        except Exception as e:
+            logger.error(f"下载 {symbol} 数据失败: {e}")
+            return False
+    
     def _initialize_models(self):
         """初始化或加载模型"""
+        # 首先检查并下载缺失的数据
+        self._ensure_data_availability()
+        
         for symbol in self.symbols:
             model_path = os.path.join(self.model_dir, f"{symbol}_enhanced.pkl")
             
@@ -180,12 +295,91 @@ class EnhancedProductionML:
             else:
                 self._train_model(symbol)
     
+    def _calculate_rsi(self, prices, period=14):
+        """计算RSI指标"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def _fetch_latest_klines(self, symbol: str, use_hourly: bool = False, last_timestamp: float = None) -> pd.DataFrame:
+        """获取最新的K线数据，根据最后更新时间智能决定获取数量"""
+        import requests
+        
+        try:
+            # Binance API endpoint
+            url = "https://api.binance.com/api/v3/klines"
+            
+            # 设置参数
+            interval = "1h" if use_hourly else "1d"
+            
+            # 智能计算需要获取的数据量
+            limit = 100  # 默认100条
+            if last_timestamp:
+                # 计算时间差
+                time_diff = time.time() - last_timestamp
+                if use_hourly:
+                    # 小时数据：每小时1条
+                    hours_diff = time_diff / 3600
+                    limit = min(1000, max(100, int(hours_diff) + 24))
+                else:
+                    # 日线数据：每天1条  
+                    days_diff = time_diff / 86400
+                    limit = min(1000, max(100, int(days_diff) + 10))
+                    
+                if limit > 100:
+                    logger.info(f"{symbol} 需要获取{limit}条最新数据")
+            
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit
+            }
+            
+            # 发送请求
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            klines = response.json()
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            # 转换数据类型
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['date'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S') if use_hourly else df['timestamp'].dt.strftime('%Y-%m-%d')
+            
+            # 转换为数值类型
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # 只保留需要的列
+            df = df[['timestamp', 'date', 'open', 'high', 'low', 'close', 'volume']]
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"获取最新K线失败: {e}")
+            return pd.DataFrame()
+    
     def _load_data(self, symbol: str, use_hourly: bool = None) -> pd.DataFrame:
         """
-        加载数据（支持小时数据）
+        加载数据（支持小时数据和实时更新）
         """
         if use_hourly is None:
             use_hourly = self.use_hourly_data
+        
+        # 缓存时间改为1分钟，以便更频繁地获取最新数据
+        cache_key = f"{symbol}_{use_hourly}"
+        if cache_key in self._data_cache:
+            if time.time() - self._cache_timestamp.get(cache_key, 0) < 60:  # 1分钟缓存
+                return self._data_cache[cache_key].copy()
             
         if use_hourly:
             # 尝试加载小时数据
@@ -202,7 +396,7 @@ class EnhancedProductionML:
                 if not os.path.exists(file_path):
                     file_path = os.path.join(self.data_dir, f"{symbol}_1d.csv")
             else:
-                logger.info(f"使用小时数据: {symbol}")
+                logger.debug(f"使用小时数据: {symbol}")
         else:
             # 使用日线数据
             file_path = os.path.join(self.data_dir, f"{symbol}.csv")
@@ -214,20 +408,78 @@ class EnhancedProductionML:
             
         df = pd.read_csv(file_path)
         
+        # 尝试获取最新的实时数据
+        try:
+            # 获取最后数据的时间戳
+            last_timestamp = None
+            if 'date' in df.columns and len(df) > 0:
+                try:
+                    last_date = pd.to_datetime(df['date'].iloc[-1])
+                    last_timestamp = last_date.timestamp()  # 转换为秒
+                except Exception as e:
+                    logger.debug(f"转换时间戳失败: {e}")
+                    pass  # 如果转换失败，使用None
+            
+            latest_data = self._fetch_latest_klines(symbol, use_hourly, last_timestamp)
+            if latest_data is not None and not latest_data.empty:
+                # 确保历史数据有timestamp列
+                if 'timestamp' not in df.columns and 'date' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['date'])
+                
+                # 合并历史数据和最新数据
+                df = pd.concat([df, latest_data], ignore_index=True)
+                
+                # 使用date列去重（因为它是统一格式的字符串）
+                if 'date' in df.columns:
+                    df = df.drop_duplicates(subset=['date'], keep='last')
+                    df = df.sort_values('date').reset_index(drop=True)
+                else:
+                    df = df.drop_duplicates(subset=['timestamp'], keep='last')
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    
+                logger.info(f"已更新 {symbol} 的最新数据，新增 {len(latest_data)} 条记录")
+                
+                # 定期保存更新的数据到CSV（每小时保存一次）
+                save_key = f"{symbol}_last_save"
+                if save_key not in self._cache_timestamp or \
+                   time.time() - self._cache_timestamp.get(save_key, 0) > 3600:
+                    df.to_csv(file_path, index=False)
+                    self._cache_timestamp[save_key] = time.time()
+                    logger.info(f"已保存 {symbol} 的更新数据到文件")
+        except Exception as e:
+            logger.warning(f"获取最新数据失败: {e}")
+        
         # 标准化列名
         df.columns = [col.lower() for col in df.columns]
         
-        # 处理时间
+        # 处理时间 - 使用更灵活的解析
         if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
+            # 尝试多种格式解析日期
+            try:
+                df['date'] = pd.to_datetime(df['date'], format='mixed')
+            except:
+                try:
+                    df['date'] = pd.to_datetime(df['date'], infer_datetime_format=True)
+                except:
+                    df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df.set_index('date', inplace=True)
         elif 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed')
+            except:
+                try:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], infer_datetime_format=True)
+                except:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             df.set_index('timestamp', inplace=True)
+        
+        # 更新缓存
+        self._data_cache[cache_key] = df.copy()
+        self._cache_timestamp[cache_key] = time.time()
         
         df.sort_index(inplace=True)
         
-        logger.info(f"加载 {symbol} 数据: {len(df)} 条记录")
+        logger.debug(f"加载 {symbol} 数据: {len(df)} 条记录")
         return df
     
     def _download_hourly_data(self, symbol: str):
@@ -855,10 +1107,17 @@ class EnhancedProductionML:
         return trade
     
     def generate_signal(self, symbol: str) -> Optional[Dict]:
-        """生成交易信号"""
-        if symbol not in self.models:
-            return None
-        
+        """生成交易信号（带锁保护，训练时暂停）"""
+        # 如果正在训练，等待训练完成
+        with self._training_lock:
+            if symbol not in self.models:
+                logger.debug(f"No model found for {symbol}")
+                return None
+            
+            if symbol not in self.selected_features:
+                logger.warning(f"No selected features for {symbol}, skipping signal generation")
+                return None
+                
         try:
             # 加载最新数据
             df = self._load_data(symbol)
@@ -869,10 +1128,10 @@ class EnhancedProductionML:
             features = self._create_enhanced_features(df)
             
             # 应用特征选择（与训练时一致）
-            if hasattr(self, 'selected_features') and symbol in self.selected_features:
+            if symbol in self.selected_features:
                 features = features[self.selected_features[symbol]]
             else:
-                logger.error(f"No selected features found for {symbol} in generate_signal")
+                logger.error(f"Feature selection failed for {symbol}")
                 return None
             
             # 获取最新特征
@@ -890,8 +1149,71 @@ class EnhancedProductionML:
             signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
             recommendation = signal_map[prediction]
             
-            # 置信度
-            confidence = float(np.max(probabilities))
+            # 改进的置信度计算
+            # 1. 基础置信度：最大概率值
+            base_confidence = float(np.max(probabilities))
+            
+            # 2. 决策清晰度：最大概率与次大概率的差值
+            sorted_probs = np.sort(probabilities)[::-1]
+            clarity_score = float(sorted_probs[0] - sorted_probs[1])
+            
+            # 3. 模型一致性：如果有多个模型，检查它们的一致性
+            model_agreement = 1.0  # 默认完全一致
+            if len(models) > 1:
+                predictions = [model.predict(latest_features_scaled)[0] for model in models.values()]
+                agreement_rate = predictions.count(prediction) / len(predictions)
+                model_agreement = agreement_rate
+            
+            # 4. 技术指标支持度（基于最新数据）
+            technical_support = 0.5  # 默认中性
+            if len(df) > 20:
+                close_price = df['close'].iloc[-1]
+                sma20 = df['close'].rolling(20).mean().iloc[-1]
+                rsi = self._calculate_rsi(df['close'], 14).iloc[-1] if len(df) > 14 else 50
+                
+                if recommendation == 'BUY':
+                    if close_price > sma20:
+                        technical_support += 0.2
+                    if rsi < 30:
+                        technical_support += 0.3
+                    elif rsi < 50:
+                        technical_support += 0.1
+                elif recommendation == 'SELL':
+                    if close_price < sma20:
+                        technical_support += 0.2
+                    if rsi > 70:
+                        technical_support += 0.3
+                    elif rsi > 50:
+                        technical_support += 0.1
+                else:  # HOLD
+                    if 40 < rsi < 60:
+                        technical_support += 0.2
+            
+            # 5. 综合置信度计算（加权平均）
+            # 权重分配：基础概率40%，清晰度20%，模型一致性20%，技术支持20%
+            confidence = (
+                base_confidence * 0.4 +
+                clarity_score * 0.2 +
+                model_agreement * 0.2 +
+                technical_support * 0.2
+            )
+            
+            # 6. 根据市场情绪调整（贪婪时更谨慎，恐慌时更大胆）
+            if self.sentiment_data and 'value' in self.sentiment_data:
+                sentiment_value = self.sentiment_data['value']
+                if sentiment_value > 75:  # 极度贪婪
+                    if recommendation == 'BUY':
+                        confidence *= 0.9  # 降低买入置信度
+                    elif recommendation == 'SELL':
+                        confidence *= 1.1  # 提高卖出置信度
+                elif sentiment_value < 25:  # 极度恐慌
+                    if recommendation == 'BUY':
+                        confidence *= 1.1  # 提高买入置信度
+                    elif recommendation == 'SELL':
+                        confidence *= 0.9  # 降低卖出置信度
+            
+            # 确保置信度在合理范围内
+            confidence = max(0.1, min(0.95, confidence))
             
             # 风险评估
             volatility = float(df['close'].pct_change().rolling(20).std().iloc[-1])
@@ -938,16 +1260,42 @@ class EnhancedProductionML:
             return None
     
     def retrain_all(self):
-        """重新训练所有模型"""
-        logger.info("开始重新训练所有增强模型...")
-        
-        # 更新市场情绪
-        self._update_market_sentiment()
-        
-        for symbol in self.symbols:
-            self._train_model(symbol)
+        """重新训练所有模型（带锁保护）"""
+        if self._is_training:
+            logger.warning("模型正在训练中，跳过本次训练请求")
+            return False
             
-        logger.info("所有模型训练完成")
+        with self._training_lock:
+            self._is_training = True
+            try:
+                logger.info("开始重新训练所有增强模型...")
+                
+                # 更新市场情绪
+                self._update_market_sentiment()
+                
+                for symbol in self.symbols:
+                    self._train_model(symbol)
+                    
+                self._last_retrain_date = datetime.now()
+                logger.info("所有模型训练完成")
+                return True
+            finally:
+                self._is_training = False
+    
+    def check_and_auto_retrain(self):
+        """检查并执行自动重训练（每天UTC 12:00）"""
+        if not self.enable_auto_retrain:
+            return
+            
+        now = datetime.utcnow()
+        # 检查是否是UTC 12:00 (允许5分钟误差)
+        if 11 <= now.hour <= 12 and now.minute < 5:
+            # 检查今天是否已经训练过
+            if self._last_retrain_date is None or \
+               self._last_retrain_date.date() < now.date():
+                logger.info(f"触发自动重训练 (UTC时间: {now})")
+                # 在新线程中执行训练，避免阻塞主线程
+                threading.Thread(target=self.retrain_all, daemon=True).start()
     
     def get_all_signals(self) -> Dict:
         """获取所有信号"""
@@ -1037,9 +1385,12 @@ def start_http_server(analyzer, port=8091):
 def main():
     """主函数"""
     import sys
+    import asyncio
+    from websocket_server import MLWebSocketServer
     
     # 检查命令行参数
     use_hourly = '--hourly' in sys.argv or '-h' in sys.argv
+    use_websocket = '--websocket' in sys.argv or '-ws' in sys.argv
     
     print("=" * 60)
     print("🚀 增强版生产级ML策略")
@@ -1047,6 +1398,8 @@ def main():
         print("📊 使用小时级数据")
     else:
         print("📊 使用日线数据")
+    if use_websocket:
+        print("🔌 启用WebSocket实时推送")
     print("=" * 60)
     
     # 创建分析器
@@ -1066,8 +1419,20 @@ def main():
     )
     http_thread.start()
     
+    # 启动WebSocket服务器
+    if use_websocket:
+        ws_server = MLWebSocketServer(analyzer, port=8765)
+        ws_thread = threading.Thread(
+            target=lambda: asyncio.run(ws_server.start()),
+            daemon=True
+        )
+        ws_thread.start()
+        print("🔌 WebSocket服务器启动在端口 8765")
+    
     print("\n✅ 增强版ML策略系统启动成功！")
     print(f"📡 HTTP API: http://localhost:8091")
+    if use_websocket:
+        print(f"🔌 WebSocket: ws://localhost:8765")
     print(f"📊 监控交易对: {', '.join(analyzer.symbols)}")
     print(f"🧠 已加载模型: {len(analyzer.models)} 个")
     print("\n📌 增强特性:")
@@ -1076,11 +1441,19 @@ def main():
     print("  - 不平衡数据处理(SMOTE)")
     print("  - 市场情绪指标集成")
     print("  - 纸上交易系统")
+    if use_websocket:
+        print("  - WebSocket实时信号推送")
     print("\n📌 API端点:")
     print("  GET /health   - 健康检查")
     print("  GET /signals  - 获取信号")
     print("  GET /metrics  - 查看指标和纸上交易")
     print("  GET /retrain  - 重新训练")
+    if use_websocket:
+        print("\n📌 WebSocket消息类型:")
+        print("  welcome - 连接欢迎消息")
+        print("  signals - 初始信号")
+        print("  signals_update - 信号更新")
+        print("  paper_trade - 纸上交易执行")
     
     # 显示初始信号
     print("\n📈 生成初始信号...")
@@ -1091,10 +1464,47 @@ def main():
             if signal.get('paper_trade', {}).get('executed'):
                 print(f"  纸上交易: {signal['paper_trade']['reason']}")
     
-    # 保持运行
+    # 保持运行并定期生成信号
     try:
+        last_signal_time = time.time()
+        signal_interval = 300  # 每5分钟生成一次信号（小时数据模式下）
+        
+        if use_hourly:
+            signal_interval = 300  # 小时数据模式：5分钟
+        else:
+            signal_interval = 3600  # 日数据模式：1小时
+            
+        print(f"\n⏰ 将每 {signal_interval//60} 分钟生成并推送新信号")
+        
         while True:
-            time.sleep(60)
+            current_time = time.time()
+            
+            # 检查自动重训练（每天UTC 12:00）
+            analyzer.check_and_auto_retrain()
+            
+            # 检查是否需要生成新信号
+            if current_time - last_signal_time >= signal_interval:
+                print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 生成新信号...")
+                
+                # 生成所有交易对的信号
+                new_signals = {}
+                for symbol in analyzer.symbols:
+                    signal = analyzer.generate_signal(symbol)
+                    if signal:
+                        new_signals[symbol] = signal
+                        print(f"  {symbol}: {signal['recommendation']} (置信度: {signal['confidence']:.2%})")
+                
+                # 如果有WebSocket客户端连接，推送信号
+                if use_websocket and ws_server and new_signals:
+                    # WebSocket服务器会通过定期检查自动广播变化的信号
+                    # 这里只需要记录日志
+                    print(f"  📤 生成了 {len(new_signals)} 个新信号")
+                
+                last_signal_time = current_time
+            
+            # 短暂休眠，避免占用过多CPU
+            time.sleep(10)
+            
     except KeyboardInterrupt:
         print("\n正在关闭...")
 
