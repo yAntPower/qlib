@@ -146,18 +146,39 @@ class EnhancedProductionML:
         self.enable_auto_retrain = enable_auto_retrain
         self._last_retrain_date = None
         
-        # 参数配置
+        # 参数配置 - 从环境变量读取
+        ml_env = os.getenv('ML_ENVIRONMENT', 'production')
+        
+        # 根据环境选择配置
+        if ml_env == 'development':
+            # 开发环境：使用更激进的参数
+            up_percentile = int(os.getenv('ML_DEV_UP_PERCENTILE', '65'))
+            down_percentile = int(os.getenv('ML_DEV_DOWN_PERCENTILE', '35'))
+            min_move = float(os.getenv('ML_DEV_MIN_MOVE', '0.001'))
+        else:
+            # 生产/staging环境：使用保守参数
+            up_percentile = int(os.getenv('ML_UP_PERCENTILE', '75'))
+            down_percentile = int(os.getenv('ML_DOWN_PERCENTILE', '25'))
+            min_move = float(os.getenv('ML_MIN_MOVE', '0.002'))
+        
         self.config = {
             'min_data_points': 500,  # 降低要求以支持新币种如SUI
-            'test_size': 0.2,
+            'test_size': float(os.getenv('ML_TEST_RATIO', '0.2')),
+            'validation_ratio': float(os.getenv('ML_VALIDATION_RATIO', '0.1')),
             'n_features': 60,  # 增加特征数量
             'prediction_horizon': 1,
             
-            # 改进的标签生成策略
-            'label_strategy': 'adaptive',  # adaptive/percentile/volatility
-            'up_percentile': 60,  # 上涨阈值百分位
-            'down_percentile': 40,  # 下跌阈值百分位
-            'min_move': 0.003,  # 最小移动阈值0.3%
+            # 标签生成策略 - 从环境变量读取
+            'label_strategy': os.getenv('ML_LABEL_STRATEGY', 'adaptive'),
+            'up_threshold': float(os.getenv('ML_UP_THRESHOLD', '0.004')),  # adaptive策略参数
+            'down_threshold': float(os.getenv('ML_DOWN_THRESHOLD', '-0.004')),
+            'up_percentile': up_percentile,  # percentile策略参数
+            'down_percentile': down_percentile,
+            'min_move': min_move,  # 最小移动阈值
+            'volatility_window': int(os.getenv('ML_VOLATILITY_WINDOW', '20')),
+            
+            # 二分类配置
+            'use_binary_classification': os.getenv('ML_USE_BINARY_CLASSIFICATION', 'true').lower() == 'true',
             
             # 不平衡数据处理
             'handle_imbalance': True,
@@ -173,7 +194,23 @@ class EnhancedProductionML:
             'stop_loss': 0.03,  # 止损3%
             'take_profit': 0.08,  # 止盈8%
             'min_confidence': 0.6,  # 最小置信度
+            
+            # 性能阈值
+            'min_accuracy': float(os.getenv('ML_MIN_ACCURACY', '0.55')),
+            'min_f1_score': float(os.getenv('ML_MIN_F1_SCORE', '0.45')),
+            'fallback_to_technical': os.getenv('ML_FALLBACK_TO_TECHNICAL', 'true').lower() == 'true',
+            
+            # 环境信息
+            'environment': ml_env
         }
+        
+        logger.info(f"ML环境: {ml_env}")
+        logger.info(f"标签策略: {self.config['label_strategy']}")
+        logger.info(f"分类模式: {'二分类' if self.config['use_binary_classification'] else '三分类'}")
+        if self.config['label_strategy'] == 'percentile':
+            logger.info(f"百分位阈值: UP={up_percentile}%, DOWN={down_percentile}%, MIN_MOVE={min_move:.3f}")
+        elif self.config['label_strategy'] == 'adaptive':
+            logger.info(f"自适应阈值: UP={self.config['up_threshold']:.3f}, DOWN={self.config['down_threshold']:.3f}")
         
         # 创建目录
         os.makedirs(self.model_dir, exist_ok=True)
@@ -483,14 +520,115 @@ class EnhancedProductionML:
         return df
     
     def _download_hourly_data(self, symbol: str):
-        """下载小时数据"""
+        """下载小时数据（2年完整数据）"""
         try:
+            import requests
+            from datetime import datetime, timedelta
+            import time
+            
             logger.info(f"正在下载 {symbol} 小时数据...")
-            # 这里应该调用binance_collector.py下载小时数据
-            # 暂时跳过
-            pass
+            
+            # 计算时间范围：从2023年1月1日开始（约2年数据）
+            end_date = datetime.now()
+            start_date = datetime(2023, 1, 1)  # 从2023年开始，数据更充分
+            
+            # 特殊处理新币种的上线时间
+            special_start_dates = {
+                'SUIUSDT': datetime(2023, 5, 3),  # SUI 2023年5月上线
+                'APTUSDT': datetime(2022, 10, 19),  # APT 2022年10月上线
+                'ARBUSDT': datetime(2023, 3, 23),  # ARB 2023年3月上线
+                'OPUSDT': datetime(2022, 6, 1),   # OP 2022年6月上线
+            }
+            
+            if symbol in special_start_dates:
+                start_date = max(start_date, special_start_dates[symbol])
+            
+            # Binance API
+            url = "https://api.binance.com/api/v3/klines"
+            all_data = []
+            
+            # 每次获取1000条（约41天的小时数据）
+            batch_size = 1000  # Binance限制每次最多1000条
+            current_start = start_date
+            
+            logger.info(f"开始下载 {symbol} 从 {start_date} 到 {end_date} 的小时数据...")
+            batch_count = 0
+            
+            while current_start < end_date:
+                # 计算批次结束时间
+                current_end = min(current_start + timedelta(hours=batch_size-1), end_date)
+                
+                params = {
+                    'symbol': symbol,
+                    'interval': '1h',
+                    'startTime': int(current_start.timestamp() * 1000),
+                    'endTime': int(current_end.timestamp() * 1000),
+                    'limit': batch_size
+                }
+                
+                # 使用代理
+                proxies = {}
+                http_proxy = os.environ.get('http_proxy')
+                if http_proxy:
+                    proxies = {'http': http_proxy, 'https': http_proxy}
+                
+                try:
+                    response = requests.get(url, params=params, proxies=proxies, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data:
+                        all_data.extend(data)
+                        batch_count += 1
+                        logger.info(f"  批次{batch_count}: 获取 {len(data)} 条记录 ({current_start.strftime('%Y-%m-%d %H:%M')} - {current_end.strftime('%Y-%m-%d %H:%M')})")
+                        
+                        # 从最后一条数据的时间戳+1小时开始下一批次（避免重复）
+                        last_timestamp = data[-1][0]
+                        current_start = datetime.fromtimestamp(last_timestamp/1000) + timedelta(hours=1)
+                    else:
+                        logger.info(f"  批次{batch_count+1}: 无数据")
+                        break
+                    
+                    time.sleep(0.2)  # 避免频率限制
+                    
+                except Exception as e:
+                    logger.warning(f"  批次下载失败: {e}，跳过...")
+                    current_start = current_end
+                    continue
+            
+            if not all_data:
+                logger.error(f"{symbol} 没有获取到数据")
+                return False
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(all_data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # 转换为float
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            
+            # 去重并排序
+            df = df.drop_duplicates(subset=['date'])
+            df = df.sort_values('date')
+            
+            # 保存到小时数据目录
+            save_path = os.path.join(self.hourly_data_dir, f"{symbol}.csv")
+            os.makedirs(self.hourly_data_dir, exist_ok=True)
+            df.to_csv(save_path, index=False)
+            
+            logger.info(f"✅ {symbol} 小时数据下载成功，共 {len(df)} 条记录，保存到 {save_path}")
+            return True
+            
         except Exception as e:
-            logger.error(f"下载小时数据失败: {e}")
+            logger.error(f"下载 {symbol} 小时数据失败: {e}")
+            return False
     
     def _update_market_sentiment(self):
         """获取市场情绪指标"""
@@ -653,52 +791,91 @@ class EnhancedProductionML:
     
     def _create_improved_labels(self, df: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
         """
-        改进的标签生成策略
+        改进的标签生成策略 - 支持二分类和三分类
         """
         future_returns = df['close'].shift(-self.config['prediction_horizon']) / df['close'] - 1
         
-        if self.config['label_strategy'] == 'adaptive':
-            # 自适应阈值：基于滚动窗口的分位数
-            window = 100
-            up_threshold = future_returns.rolling(window).quantile(self.config['up_percentile']/100)
-            down_threshold = future_returns.rolling(window).quantile(self.config['down_percentile']/100)
-            
-            # 考虑最小移动
-            up_threshold = up_threshold.clip(lower=self.config['min_move'])
-            down_threshold = down_threshold.clip(upper=-self.config['min_move'])
-            
-        elif self.config['label_strategy'] == 'volatility':
-            # 基于波动率的动态阈值
-            volatility = df['close'].pct_change().rolling(20).std()
-            up_threshold = volatility * 0.5
-            down_threshold = -volatility * 0.5
-            
-        else:  # percentile
-            # 使用历史百分位
-            up_threshold = np.percentile(future_returns.dropna(), self.config['up_percentile'])
-            down_threshold = np.percentile(future_returns.dropna(), self.config['down_percentile'])
+        # 使用二分类配置
+        use_binary = self.config.get('use_binary_classification', True)
         
-        # 创建标签
-        labels = pd.Series(index=df.index, dtype=int)
-        
-        # 处理阈值是Series的情况
-        if isinstance(up_threshold, pd.Series):
-            for i in df.index:
-                if i in future_returns.index and i in up_threshold.index:
-                    if future_returns[i] > up_threshold[i]:
-                        labels[i] = 2  # 上涨
-                    elif future_returns[i] < down_threshold[i]:
-                        labels[i] = 0  # 下跌
-                    else:
-                        labels[i] = 1  # 横盘
+        if use_binary:
+            # 二分类：只有BUY(1)和SELL(0)
+            if self.config['label_strategy'] == 'adaptive':
+                # 使用0作为分界点
+                threshold = 0.0
+            elif self.config['label_strategy'] == 'volatility_adjusted':
+                # 基于波动率的动态阈值，但使用0作为中心
+                volatility = df['close'].pct_change().rolling(self.config['volatility_window']).std()
+                threshold = 0.0  # 二分类使用0作为分界
+            else:  # percentile
+                # 使用中位数作为分界点
+                threshold = np.median(future_returns.dropna())
+            
+            # 创建二分类标签
+            labels = pd.Series(index=df.index, dtype=int)
+            labels[future_returns > threshold] = 1  # BUY
+            labels[future_returns <= threshold] = 0  # SELL
+            
+            # 统计标签分布
+            label_counts = labels.value_counts()
+            logger.info(f"二分类标签分布: SELL={label_counts.get(0, 0)}, BUY={label_counts.get(1, 0)}")
+            
         else:
-            labels[future_returns > up_threshold] = 2  # 上涨
-            labels[future_returns < down_threshold] = 0  # 下跌
-            labels[(future_returns >= down_threshold) & (future_returns <= up_threshold)] = 1  # 横盘
-        
-        # 统计标签分布
-        label_counts = labels.value_counts()
-        logger.info(f"标签分布: 下跌={label_counts.get(0, 0)}, 横盘={label_counts.get(1, 0)}, 上涨={label_counts.get(2, 0)}")
+            # 三分类（原有逻辑）
+            if self.config['label_strategy'] == 'adaptive':
+                # 自适应阈值：使用固定阈值
+                up_threshold = self.config['up_threshold']
+                down_threshold = self.config['down_threshold']
+                
+                # 确保阈值合理
+                if up_threshold <= 0:
+                    up_threshold = 0.004  # 默认0.4%
+                if down_threshold >= 0:
+                    down_threshold = -0.004  # 默认-0.4%
+                
+            elif self.config['label_strategy'] == 'volatility_adjusted':
+                # 基于波动率的动态阈值
+                volatility = df['close'].pct_change().rolling(self.config['volatility_window']).std()
+                mean_vol = volatility.mean()
+                up_threshold = mean_vol * 1.0  # 1倍标准差
+                down_threshold = -mean_vol * 1.0
+                
+                # 应用最小移动阈值
+                up_threshold = max(up_threshold, self.config['min_move'])
+                down_threshold = min(down_threshold, -self.config['min_move'])
+                
+            else:  # percentile
+                # 使用历史百分位
+                up_threshold = np.percentile(future_returns.dropna(), self.config['up_percentile'])
+                down_threshold = np.percentile(future_returns.dropna(), self.config['down_percentile'])
+                
+                # 应用最小移动阈值
+                if abs(up_threshold) < self.config['min_move']:
+                    up_threshold = self.config['min_move']
+                if abs(down_threshold) < self.config['min_move']:
+                    down_threshold = -self.config['min_move']
+            
+            # 创建标签
+            labels = pd.Series(index=df.index, dtype=int)
+            
+            # 处理阈值是Series的情况
+            if isinstance(up_threshold, pd.Series):
+                for i in df.index:
+                    if i in future_returns.index and i in up_threshold.index:
+                        if future_returns[i] > up_threshold[i]:
+                            labels[i] = 2  # 上涨
+                        elif future_returns[i] < down_threshold[i]:
+                            labels[i] = 0  # 下跌
+                        else:
+                            labels[i] = 1  # 横盘
+            else:
+                labels[future_returns > up_threshold] = 2  # 上涨
+                labels[future_returns < down_threshold] = 0  # 下跌
+                labels[(future_returns >= down_threshold) & (future_returns <= up_threshold)] = 1  # 横盘
+            
+            # 统计标签分布
+            label_counts = labels.value_counts()
+            logger.info(f"三分类标签分布: 下跌={label_counts.get(0, 0)}, 横盘={label_counts.get(1, 0)}, 上涨={label_counts.get(2, 0)}")
         
         return labels
     
@@ -1117,6 +1294,17 @@ class EnhancedProductionML:
             if symbol not in self.selected_features:
                 logger.warning(f"No selected features for {symbol}, skipping signal generation")
                 return None
+            
+            # 检查模型性能是否达标
+            model_metrics = self.model_metrics.get(symbol, {})
+            accuracy = model_metrics.get('accuracy', 0)
+            f1_score = model_metrics.get('f1_score', 0)
+            
+            # 如果模型性能低于阈值且配置了回退到技术指标
+            if self.config['fallback_to_technical']:
+                if accuracy < self.config['min_accuracy'] or f1_score < self.config['min_f1_score']:
+                    logger.warning(f"{symbol} 模型性能不达标 (准确率={accuracy:.2%}, F1={f1_score:.3f}), 回退到技术指标策略")
+                    return self._generate_technical_signal(symbol)
                 
         try:
             # 加载最新数据
@@ -1145,17 +1333,27 @@ class EnhancedProductionML:
             prediction = self._ensemble_predict(models, latest_features_scaled)[0]
             probabilities = self._ensemble_predict_proba(models, latest_features_scaled)[0]
             
-            # 映射
-            signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
-            recommendation = signal_map[prediction]
+            # 根据分类模式映射
+            use_binary = self.config.get('use_binary_classification', True)
+            if use_binary:
+                # 二分类映射
+                signal_map = {0: 'SELL', 1: 'BUY'}
+                recommendation = signal_map[prediction]
+            else:
+                # 三分类映射
+                signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
+                recommendation = signal_map[prediction]
             
             # 改进的置信度计算
-            # 1. 基础置信度：最大概率值
-            base_confidence = float(np.max(probabilities))
+            # 1. 基础置信度：对应预测类别的概率（而不是最大概率）
+            base_confidence = float(probabilities[prediction])
             
             # 2. 决策清晰度：最大概率与次大概率的差值
             sorted_probs = np.sort(probabilities)[::-1]
-            clarity_score = float(sorted_probs[0] - sorted_probs[1])
+            if len(sorted_probs) >= 2:
+                clarity_score = float(sorted_probs[0] - sorted_probs[1])
+            else:
+                clarity_score = float(sorted_probs[0])  # 只有一个概率时使用该概率
             
             # 3. 模型一致性：如果有多个模型，检查它们的一致性
             model_agreement = 1.0  # 默认完全一致
@@ -1225,6 +1423,25 @@ class EnhancedProductionML:
             else:
                 risk_level = 'LOW'
             
+            # 根据分类模式构建概率信息
+            if use_binary:
+                ai_prediction = {
+                    'direction': recommendation,
+                    'probability_sell': float(probabilities[0]),
+                    'probability_buy': float(probabilities[1]),
+                    'model_type': 'ENHANCED_ENSEMBLE_BINARY',
+                    'models_used': list(models.keys())
+                }
+            else:
+                ai_prediction = {
+                    'direction': recommendation,
+                    'probability_down': float(probabilities[0]),
+                    'probability_hold': float(probabilities[1]),
+                    'probability_up': float(probabilities[2]),
+                    'model_type': 'ENHANCED_ENSEMBLE',
+                    'models_used': list(models.keys())
+                }
+            
             signal = {
                 'symbol': symbol,
                 'timestamp': datetime.now().isoformat(),
@@ -1232,14 +1449,7 @@ class EnhancedProductionML:
                 'confidence': confidence,
                 'price': float(df['close'].iloc[-1]),
                 'volume': float(df['volume'].iloc[-1]),
-                'ai_prediction': {
-                    'direction': recommendation,
-                    'probability_down': float(probabilities[0]),
-                    'probability_hold': float(probabilities[1]),
-                    'probability_up': float(probabilities[2]),
-                    'model_type': 'ENHANCED_ENSEMBLE',
-                    'models_used': list(models.keys())
-                },
+                'ai_prediction': ai_prediction,
                 'risk_metrics': {
                     'risk_level': risk_level,
                     'volatility': volatility,
@@ -1259,6 +1469,85 @@ class EnhancedProductionML:
             logger.error(f"生成信号失败 {symbol}: {e}")
             return None
     
+    def _generate_technical_signal(self, symbol: str) -> Optional[Dict]:
+        """基于技术指标生成信号（作为ML模型的备用方案）"""
+        try:
+            # 加载最新数据
+            df = self._load_data(symbol)
+            if len(df) < 50:
+                return None
+            
+            # 计算技术指标
+            df['sma_20'] = df['close'].rolling(20).mean()
+            df['sma_50'] = df['close'].rolling(50).mean()
+            df['rsi'] = self._calculate_rsi(df['close'], 14)
+            
+            # 获取最新值
+            latest = df.iloc[-1]
+            close_price = latest['close']
+            sma_20 = latest['sma_20']
+            sma_50 = latest['sma_50']
+            rsi = latest['rsi']
+            
+            # 生成信号
+            signal_strength = 0
+            
+            # 移动平均线信号
+            if sma_20 > sma_50:
+                signal_strength += 1
+            else:
+                signal_strength -= 1
+            
+            # 价格相对于MA的位置
+            if close_price > sma_20:
+                signal_strength += 0.5
+            else:
+                signal_strength -= 0.5
+            
+            # RSI信号
+            if rsi < 30:
+                signal_strength += 1.5  # 超卖
+            elif rsi > 70:
+                signal_strength -= 1.5  # 超买
+            elif rsi < 45:
+                signal_strength += 0.5
+            elif rsi > 55:
+                signal_strength -= 0.5
+            
+            # 生成推荐
+            if signal_strength >= 1.5:
+                recommendation = 'BUY'
+                confidence = min(0.65 + signal_strength * 0.05, 0.85)
+            elif signal_strength <= -1.5:
+                recommendation = 'SELL'
+                confidence = min(0.65 + abs(signal_strength) * 0.05, 0.85)
+            else:
+                recommendation = 'HOLD'
+                confidence = 0.5 + abs(signal_strength) * 0.1
+            
+            return {
+                'symbol': symbol,
+                'recommendation': recommendation,
+                'confidence': float(confidence),
+                'price': float(close_price),
+                'source': 'TECHNICAL',  # 标记为技术指标信号
+                'indicators': {
+                    'rsi': float(rsi),
+                    'sma_20': float(sma_20),
+                    'sma_50': float(sma_50),
+                    'signal_strength': float(signal_strength)
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"生成技术信号失败 {symbol}: {e}")
+            return None
+    
+    def retrain_all_models(self, force: bool = False):
+        """重新训练所有模型（提供别名方法）"""
+        return self.retrain_all()
+    
     def retrain_all(self):
         """重新训练所有模型（带锁保护）"""
         if self._is_training:
@@ -1268,17 +1557,23 @@ class EnhancedProductionML:
         with self._training_lock:
             self._is_training = True
             try:
-                logger.info("开始重新训练所有增强模型...")
+                logger.info(f"开始重新训练所有增强模型... 币种列表: {self.symbols}")
                 
                 # 更新市场情绪
                 self._update_market_sentiment()
                 
-                for symbol in self.symbols:
+                # 训练所有币种
+                for i, symbol in enumerate(self.symbols, 1):
+                    logger.info(f"训练进度: [{i}/{len(self.symbols)}] 正在训练 {symbol} 模型...")
                     self._train_model(symbol)
+                    logger.info(f"✓ {symbol} 模型训练完成")
                     
                 self._last_retrain_date = datetime.now()
-                logger.info("所有模型训练完成")
+                logger.info(f"所有模型训练完成 (UTC时间: {datetime.utcnow()})")
                 return True
+            except Exception as e:
+                logger.error(f"模型训练失败: {e}")
+                return False
             finally:
                 self._is_training = False
     
@@ -1288,14 +1583,20 @@ class EnhancedProductionML:
             return
             
         now = datetime.utcnow()
-        # 检查是否是UTC 12:00 (允许5分钟误差)
-        if 11 <= now.hour <= 12 and now.minute < 5:
+        # 检查是否是UTC 12:00 (允许前后30分钟误差，更宽松的时间窗口)
+        # 11:30 到 12:30 之间都可以触发
+        if (now.hour == 11 and now.minute >= 30) or (now.hour == 12 and now.minute <= 30):
             # 检查今天是否已经训练过
             if self._last_retrain_date is None or \
                self._last_retrain_date.date() < now.date():
-                logger.info(f"触发自动重训练 (UTC时间: {now})")
+                logger.info(f"触发自动重训练 (UTC时间: {now}, 当地时间: {datetime.now()})")
+                logger.info(f"上次训练时间: {self._last_retrain_date}")
                 # 在新线程中执行训练，避免阻塞主线程
                 threading.Thread(target=self.retrain_all, daemon=True).start()
+        
+        # 每小时输出一次当前UTC时间，方便调试
+        if now.minute == 0 and now.second < 30:
+            logger.info(f"当前UTC时间: {now.strftime('%Y-%m-%d %H:%M:%S')}, 等待12:00触发重训练")
     
     def get_all_signals(self) -> Dict:
         """获取所有信号"""
@@ -1350,17 +1651,46 @@ class EnhancedMLHTTPHandler(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(response).encode())
             
-        elif self.path == '/retrain':
+        elif self.path == '/retrain' or self.path.startswith('/retrain/'):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             
-            threading.Thread(target=self.server.analyzer.retrain_all).start()
+            # 检查是否指定了特定币种
+            if self.path.startswith('/retrain/'):
+                symbol = self.path.split('/')[-1]
+                if symbol in self.server.analyzer.symbols:
+                    # 使用更安全的方式：创建包装函数来处理单个币种训练
+                    def train_single():
+                        with self.server.analyzer._training_lock:
+                            if not self.server.analyzer._is_training:
+                                self.server.analyzer._is_training = True
+                                try:
+                                    logger.info(f"手动触发 {symbol} 模型重训练")
+                                    self.server.analyzer._train_model(symbol)
+                                    logger.info(f"{symbol} 模型重训练完成")
+                                finally:
+                                    self.server.analyzer._is_training = False
+                            else:
+                                logger.warning(f"模型正在训练中，跳过 {symbol} 训练请求")
+                    
+                    threading.Thread(target=train_single, daemon=True).start()
+                    response = {
+                        'status': 'success',
+                        'message': f'Retraining {symbol} started'
+                    }
+                else:
+                    response = {
+                        'status': 'error',
+                        'message': f'Symbol {symbol} not found'
+                    }
+            else:
+                threading.Thread(target=self.server.analyzer.retrain_all).start()
+                response = {
+                    'status': 'success',
+                    'message': 'Retraining all models started'
+                }
             
-            response = {
-                'status': 'success',
-                'message': 'Retraining started'
-            }
             self.wfile.write(json.dumps(response).encode())
             
         else:
@@ -1476,11 +1806,17 @@ def main():
             
         print(f"\n⏰ 将每 {signal_interval//60} 分钟生成并推送新信号")
         
+        # 记录上次检查重训练的时间
+        last_retrain_check = 0
+        retrain_check_interval = 60  # 每分钟检查一次是否需要重训练
+        
         while True:
             current_time = time.time()
             
-            # 检查自动重训练（每天UTC 12:00）
-            analyzer.check_and_auto_retrain()
+            # 每分钟检查一次自动重训练（每天UTC 12:00）
+            if current_time - last_retrain_check >= retrain_check_interval:
+                analyzer.check_and_auto_retrain()
+                last_retrain_check = current_time
             
             # 检查是否需要生成新信号
             if current_time - last_signal_time >= signal_interval:
