@@ -99,8 +99,10 @@ class MLWebSocketServer:
                 # 获取最新信号
                 signals = self.analyzer.get_all_signals()
                 
-                # 检查是否有新信号或信号变化
-                new_signals = {}
+                # 获取所有符合条件的信号（不仅仅是变化的）
+                valid_signals = {}
+                changed_signals = {}
+                
                 for symbol, signal in signals.items():
                     if not signal:
                         continue
@@ -109,32 +111,40 @@ class MLWebSocketServer:
                     if signal.get('confidence', 0) <= 0.30:
                         continue
                     
+                    # 添加到有效信号列表
+                    valid_signals[symbol] = signal
+                    
                     # 检查信号是否变化
                     last_signal = self.last_signals.get(symbol, {})
                     
                     # 比较关键字段
                     if (last_signal.get('recommendation') != signal.get('recommendation') or
                         abs(last_signal.get('confidence', 0) - signal.get('confidence', 0)) > 0.05):
-                        new_signals[symbol] = signal
-                        logger.info(f"检测到新信号: {symbol} - {signal['recommendation']} "
+                        changed_signals[symbol] = signal
+                        logger.info(f"检测到信号变化: {symbol} - {signal['recommendation']} "
                                   f"(置信度: {signal['confidence']*100:.1f}%)")
                 
-                # 如果有新信号，广播给所有客户端
-                if new_signals:
+                # 广播所有有效信号（不仅仅是变化的）
+                if valid_signals:
+                    # 记录有多少个信号
+                    logger.info(f"当前有效信号总数: {len(valid_signals)} 个")
+                    
+                    # 广播信号
                     message = {
                         "type": "signals_update",
                         "timestamp": datetime.now().isoformat(),
-                        "data": new_signals
+                        "data": valid_signals,  # 发送所有有效信号
+                        "changed": list(changed_signals.keys())  # 标记哪些是变化的
                     }
                     await self.broadcast(message)
                     
                     # 更新最后信号记录
-                    for symbol, signal in new_signals.items():
+                    for symbol, signal in valid_signals.items():
                         self.last_signals[symbol] = signal
                         
-                    # 触发纸上交易（如果方法存在）
+                    # 触发纸上交易（仅对变化的信号）
                     if hasattr(self.analyzer, 'execute_paper_trade'):
-                        for symbol, signal in new_signals.items():
+                        for symbol, signal in changed_signals.items():
                             if signal.get('recommendation') in ['BUY', 'SELL']:
                                 trade_result = self.analyzer.execute_paper_trade(
                                     symbol, 

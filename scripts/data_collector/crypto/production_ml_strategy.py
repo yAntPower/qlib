@@ -412,10 +412,10 @@ class EnhancedProductionML:
         if use_hourly is None:
             use_hourly = self.use_hourly_data
         
-        # 缓存时间改为1分钟，以便更频繁地获取最新数据
+        # 缓存时间改为5分钟，避免频繁更新
         cache_key = f"{symbol}_{use_hourly}"
         if cache_key in self._data_cache:
-            if time.time() - self._cache_timestamp.get(cache_key, 0) < 60:  # 1分钟缓存
+            if time.time() - self._cache_timestamp.get(cache_key, 0) < 300:  # 5分钟缓存
                 return self._data_cache[cache_key].copy()
             
         if use_hourly:
@@ -474,7 +474,7 @@ class EnhancedProductionML:
                     df = df.drop_duplicates(subset=['timestamp'], keep='last')
                     df = df.sort_values('timestamp').reset_index(drop=True)
                     
-                logger.info(f"已更新 {symbol} 的最新数据，新增 {len(latest_data)} 条记录")
+                logger.debug(f"已更新 {symbol} 的最新数据，新增 {len(latest_data)} 条记录")  # 改为debug级别，减少日志
                 
                 # 定期保存更新的数据到CSV（每小时保存一次）
                 save_key = f"{symbol}_last_save"
@@ -482,7 +482,7 @@ class EnhancedProductionML:
                    time.time() - self._cache_timestamp.get(save_key, 0) > 3600:
                     df.to_csv(file_path, index=False)
                     self._cache_timestamp[save_key] = time.time()
-                    logger.info(f"已保存 {symbol} 的更新数据到文件")
+                    logger.debug(f"已保存 {symbol} 的更新数据到文件")  # 改为debug级别
         except Exception as e:
             logger.warning(f"获取最新数据失败: {e}")
         
@@ -1283,6 +1283,27 @@ class EnhancedProductionML:
         
         return trade
     
+    def update_all_data(self):
+        """批量更新所有币种的数据（避免重复下载）"""
+        logger.info(f"批量更新 {len(self.symbols)} 个币种的数据...")
+        
+        for symbol in self.symbols:
+            try:
+                # 强制清除缓存，确保获取最新数据
+                cache_key = f"{symbol}_{self.use_hourly_data}"
+                if cache_key in self._data_cache:
+                    del self._data_cache[cache_key]
+                if cache_key in self._cache_timestamp:
+                    del self._cache_timestamp[cache_key]
+                
+                # 加载数据（会自动获取最新数据）
+                self._load_data(symbol)
+                logger.debug(f"  ✓ {symbol} 数据更新完成")
+            except Exception as e:
+                logger.warning(f"  ✗ {symbol} 数据更新失败: {e}")
+        
+        logger.info("批量数据更新完成")
+    
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """生成交易信号（带锁保护，训练时暂停）"""
         # 如果正在训练，等待训练完成
@@ -1599,12 +1620,22 @@ class EnhancedProductionML:
             logger.info(f"当前UTC时间: {now.strftime('%Y-%m-%d %H:%M:%S')}, 等待12:00触发重训练")
     
     def get_all_signals(self) -> Dict:
-        """获取所有信号"""
+        """获取所有信号（不重复更新数据）"""
         signals = {}
+        logger.info(f"正在为 {len(self.symbols)} 个币种生成信号...")
+        
         for symbol in self.symbols:
-            signal = self.generate_signal(symbol)
-            if signal:
-                signals[symbol] = signal
+            try:
+                signal = self.generate_signal(symbol)
+                if signal:
+                    signals[symbol] = signal
+                    logger.debug(f"  {symbol}: {signal.get('recommendation', 'N/A')} (置信度: {signal.get('confidence', 0):.2%})")
+                else:
+                    logger.debug(f"  {symbol}: 无信号")
+            except Exception as e:
+                logger.error(f"  {symbol}: 生成信号失败 - {e}")
+        
+        logger.info(f"信号生成完成: 共生成 {len(signals)} 个有效信号")
         return signals
 
 
@@ -1821,6 +1852,9 @@ def main():
             # 检查是否需要生成新信号
             if current_time - last_signal_time >= signal_interval:
                 print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 生成新信号...")
+                
+                # 批量更新所有币种的数据（避免重复）
+                analyzer.update_all_data()
                 
                 # 生成所有交易对的信号
                 new_signals = {}
