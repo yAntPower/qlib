@@ -39,15 +39,8 @@ try:
     IMBLEARN_AVAILABLE = True
 except ImportError:
     IMBLEARN_AVAILABLE = False
-    print("Installing imblearn for balanced data handling...")
-    os.system("pip install imbalanced-learn")
-    try:
-        from imblearn.over_sampling import SMOTE
-        from imblearn.under_sampling import RandomUnderSampler
-        from imblearn.combine import SMOTEENN
-        IMBLEARN_AVAILABLE = True
-    except:
-        pass
+    logger.warning("未找到imbalanced-learn库，不平衡数据处理功能将被禁用")
+    logger.info("请手动安装: pip install imbalanced-learn")
 
 # XGBoost和LightGBM
 try:
@@ -63,6 +56,8 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
+# 专门过滤LightGBM的参数警告
+warnings.filterwarnings('ignore', category=UserWarning, module='lightgbm')
 
 # 配置日志
 logging.basicConfig(
@@ -332,14 +327,6 @@ class EnhancedProductionML:
             else:
                 self._train_model(symbol)
     
-    def _calculate_rsi(self, prices, period=14):
-        """计算RSI指标"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
     
     def _fetch_latest_klines(self, symbol: str, use_hourly: bool = False, last_timestamp: float = None) -> pd.DataFrame:
         """获取最新的K线数据，根据最后更新时间智能决定获取数量"""
@@ -374,6 +361,9 @@ class EnhancedProductionML:
                 "interval": interval,
                 "limit": limit
             }
+            if last_timestamp:
+                # 从最后一根K线之后开始
+                params["startTime"] = int((last_timestamp + 1) * 1000)
             
             # 发送请求
             response = requests.get(url, params=params, timeout=10)
@@ -631,24 +621,67 @@ class EnhancedProductionML:
             return False
     
     def _update_market_sentiment(self):
-        """获取市场情绪指标"""
-        try:
-            # 恐贪指数API（示例）
-            response = requests.get(
-                "https://api.alternative.me/fng/",
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if 'data' in data and len(data['data']) > 0:
-                    self.sentiment_data['fear_greed'] = {
-                        'value': int(data['data'][0]['value']),
-                        'classification': data['data'][0]['value_classification']
-                    }
-                    logger.info(f"恐贪指数: {self.sentiment_data['fear_greed']}")
-        except Exception as e:
-            logger.warning(f"获取市场情绪失败: {e}")
-            self.sentiment_data['fear_greed'] = {'value': 50, 'classification': 'Neutral'}
+        """获取市场情绪指标（带重试机制）"""
+        # 默认值（中性）
+        default_sentiment = {'value': 50, 'classification': 'Neutral'}
+        
+        # 检查缓存（每30分钟更新一次）
+        cache_key = 'sentiment_last_update'
+        current_time = time.time()
+        if cache_key in self._cache_timestamp:
+            if current_time - self._cache_timestamp[cache_key] < 1800:  # 30分钟缓存
+                return
+        
+        max_retries = 2
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # 使用代理设置
+                proxies = {}
+                http_proxy = os.environ.get('http_proxy')
+                if http_proxy:
+                    proxies = {'http': http_proxy, 'https': http_proxy}
+                
+                # 恐贪指数API
+                response = requests.get(
+                    "https://api.alternative.me/fng/",
+                    timeout=10,  # 增加超时时间
+                    proxies=proxies
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'data' in data and len(data['data']) > 0:
+                        self.sentiment_data['fear_greed'] = {
+                            'value': int(data['data'][0]['value']),
+                            'classification': data['data'][0]['value_classification']
+                        }
+                        self._cache_timestamp[cache_key] = current_time
+                        logger.debug(f"恐贪指数更新: {self.sentiment_data['fear_greed']}")  # 改为debug级别
+                        return
+                    else:
+                        logger.debug(f"恐贪指数API返回数据格式异常: {data}")
+                else:
+                    logger.debug(f"恐贪指数API返回状态码: {response.status_code}")
+                    
+            except requests.exceptions.Timeout:
+                logger.debug(f"恐贪指数API超时（第{attempt+1}次尝试）")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # 指数退避
+                    continue
+            except Exception as e:
+                logger.debug(f"获取恐贪指数失败（第{attempt+1}次）: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+        
+        # 所有重试失败，使用默认值
+        if 'fear_greed' not in self.sentiment_data:
+            self.sentiment_data['fear_greed'] = default_sentiment
+            logger.info(f"恐贪指数获取失败，使用默认值: {default_sentiment}")
     
     def _create_enhanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -884,6 +917,8 @@ class EnhancedProductionML:
         处理不平衡数据
         """
         if not self.config['handle_imbalance'] or not IMBLEARN_AVAILABLE:
+            if not IMBLEARN_AVAILABLE:
+                logger.warning("由于imblearn库不可用，跳过不平衡数据处理")
             return X, y
         
         strategy = self.config['imbalance_strategy']
@@ -981,16 +1016,33 @@ class EnhancedProductionML:
         # XGBoost
         if XGBOOST_AVAILABLE:
             logger.info("训练XGBoost...")
-            xgb_model = xgb.XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.01,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                scale_pos_weight=class_weights[2] if 2 in class_weights else 1,  # 处理不平衡
-                n_jobs=-1
-            )
+            is_binary = self.config.get('use_binary_classification', True) and len(classes) == 2
+            if is_binary:
+                xgb_model = xgb.XGBClassifier(
+                    n_estimators=200,
+                    max_depth=6,
+                    learning_rate=0.01,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    objective='binary:logistic',
+                    eval_metric='logloss',
+                    scale_pos_weight=float(class_weight_dict.get(1, 1.0)),
+                    n_jobs=-1
+                )
+            else:
+                xgb_model = xgb.XGBClassifier(
+                    n_estimators=200,
+                    max_depth=6,
+                    learning_rate=0.01,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    objective='multi:softprob',
+                    num_class=int(len(classes)),
+                    eval_metric='mlogloss',
+                    n_jobs=-1
+                )
             xgb_model.fit(X_train_scaled, y_train_balanced)
             models['xgboost'] = xgb_model
             scores['xgboost'] = xgb_model.score(X_test_scaled, y_test)
@@ -1007,7 +1059,8 @@ class EnhancedProductionML:
                 bagging_freq=5,
                 random_state=42,
                 class_weight='balanced',  # 自动平衡
-                n_jobs=-1
+                n_jobs=-1,
+                verbosity=-1  # 静默模式，减少警告信息
             )
             lgb_model.fit(X_train_scaled, y_train_balanced)
             models['lightgbm'] = lgb_model
@@ -1059,22 +1112,15 @@ class EnhancedProductionML:
         self._save_models(symbol)
     
     def _ensemble_predict(self, models: Dict, X: np.ndarray) -> np.ndarray:
-        """集成预测"""
-        predictions = []
-        weights = {
-            'xgboost': 0.35,
-            'lightgbm': 0.35,
-            'rf': 0.2,
-            'gb': 0.1
-        }
-        
+        """集成预测（基于概率加权的argmax）"""
+        weights = {'xgboost': 0.35, 'lightgbm': 0.35, 'rf': 0.2, 'gb': 0.1}
+        proba_sum = None
         for name, model in models.items():
-            pred = model.predict(X)
-            weight = weights.get(name, 1.0 / len(models))
-            predictions.append(pred * weight)
-        
-        ensemble_pred = np.sum(predictions, axis=0)
-        return np.round(ensemble_pred).astype(int)
+            proba = model.predict_proba(X)
+            w = weights.get(name, 1.0 / max(1, len(models)))
+            proba = proba * w
+            proba_sum = proba if proba_sum is None else (proba_sum + proba)
+        return np.argmax(proba_sum, axis=1)
     
     def _ensemble_predict_proba(self, models: Dict, X: np.ndarray) -> np.ndarray:
         """集成预测概率"""
@@ -1161,14 +1207,19 @@ class EnhancedProductionML:
         
         # 生成交易信号
         positions = pd.Series(index=df_valid.index, dtype=float)
+        use_binary = self.config.get('use_binary_classification', True)
         
         # 只在高置信度时交易
         max_prob = np.max(probabilities, axis=1)
         confident_mask = max_prob > self.config['min_confidence']
         
-        positions[predictions == 2] = 1.0   # 买入
-        positions[predictions == 0] = -1.0  # 卖出
-        positions[predictions == 1] = 0.0   # 持有
+        if use_binary:
+            positions[predictions == 1] = 1.0   # BUY -> 多头
+            positions[predictions == 0] = -1.0  # SELL -> 空头
+        else:
+            positions[predictions == 2] = 1.0   # 上涨
+            positions[predictions == 0] = -1.0  # 下跌
+            positions[predictions == 1] = 0.0   # 横盘
         
         # 应用置信度过滤
         positions = positions * confident_mask
@@ -1203,11 +1254,12 @@ class EnhancedProductionML:
         drawdown = (cum_strategy_returns - rolling_max) / rolling_max
         max_drawdown = float(drawdown.min())
         
-        # 胜率
-        winning_trades = (strategy_returns > fees).sum()
-        losing_trades = (strategy_returns < -fees).sum()
+        # 以换仓点的策略收益评估胜负
+        trade_pnl = strategy_returns[trade_mask]
+        win_rate = float((trade_pnl > 0).mean()) if len(trade_pnl) > 0 else 0.0
+        winning_trades = int((trade_pnl > 0).sum())
+        losing_trades = int((trade_pnl <= 0).sum())
         total_trades = winning_trades + losing_trades
-        win_rate = winning_trades / total_trades if total_trades > 0 else 0
         
         backtest_results = {
             'symbol': symbol,
@@ -1418,8 +1470,9 @@ class EnhancedProductionML:
             )
             
             # 6. 根据市场情绪调整（贪婪时更谨慎，恐慌时更大胆）
-            if self.sentiment_data and 'value' in self.sentiment_data:
-                sentiment_value = self.sentiment_data['value']
+            fg = self.sentiment_data.get('fear_greed', {})
+            sentiment_value = fg.get('value')
+            if sentiment_value is not None:
                 if sentiment_value > 75:  # 极度贪婪
                     if recommendation == 'BUY':
                         confidence *= 0.9  # 降低买入置信度
@@ -1735,7 +1788,7 @@ class EnhancedMLHTTPHandler(BaseHTTPRequestHandler):
 def start_http_server(analyzer, port=8091):
     """启动HTTP服务器"""
     try:
-        httpd = HTTPServer(('', port), EnhancedMLHTTPHandler)
+        httpd = HTTPServer(('127.0.0.1', port), EnhancedMLHTTPHandler)
         httpd.analyzer = analyzer
         logger.info(f"HTTP服务器启动在端口 {port}")
         httpd.serve_forever()
