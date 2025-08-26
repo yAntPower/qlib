@@ -1358,6 +1358,7 @@ class EnhancedProductionML:
     
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """生成交易信号（带锁保护，训练时暂停）"""
+        self._update_market_sentiment()
         # 如果正在训练，等待训练完成
         with self._training_lock:
             if symbol not in self.models:
