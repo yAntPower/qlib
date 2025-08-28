@@ -122,6 +122,7 @@ class EnhancedProductionML:
         self.scalers = {}
         self.label_encoders = {}
         self.selected_features = {}  # 保存选择的特征
+        self.feature_selectors = {}  # 保存特征选择器（修复数据泄漏）
         
         # 性能指标
         self.model_metrics = {}
@@ -130,6 +131,10 @@ class EnhancedProductionML:
         
         # 市场情绪数据
         self.sentiment_data = {}
+        
+        # 历史情绪数据（修复数据泄漏）
+        self.historical_sentiment = pd.DataFrame()
+        self._sentiment_cache_file = 'data/crypto/historical_sentiment.csv'
         
         # 数据缓存(避免重复加载)
         self._data_cache = {}
@@ -211,6 +216,9 @@ class EnhancedProductionML:
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.hourly_data_dir, exist_ok=True)
         
+        # 初始化历史情绪数据
+        self._initialize_historical_sentiment()
+        
         # 初始化模型
         self._initialize_models()
         
@@ -218,6 +226,98 @@ class EnhancedProductionML:
         self._update_market_sentiment()
         
         logger.info(f"增强版ML策略初始化完成")
+    
+    def _initialize_historical_sentiment(self):
+        """初始化历史情绪数据"""
+        try:
+            if os.path.exists(self._sentiment_cache_file):
+                # 加载已有的历史数据
+                self.historical_sentiment = pd.read_csv(
+                    self._sentiment_cache_file,
+                    index_col='date',
+                    parse_dates=True
+                )
+                logger.info(f"加载历史情绪数据: {len(self.historical_sentiment)} 条记录")
+            else:
+                # 下载历史数据
+                self._download_historical_sentiment()
+        except Exception as e:
+            logger.error(f"初始化历史情绪数据失败: {e}")
+            self.historical_sentiment = pd.DataFrame(columns=['fear_greed'])
+    
+    def _download_historical_sentiment(self):
+        """下载历史恐贪指数数据"""
+        try:
+            logger.info("开始下载历史恐贪指数...")
+            
+            # Alternative.me API 支持历史数据
+            url = "https://api.alternative.me/fng/"
+            params = {
+                'limit': 730,  # 最多2年
+                'format': 'json'
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'data' in data:
+                    records = []
+                    for item in data['data']:
+                        timestamp = int(item['timestamp'])
+                        date = datetime.fromtimestamp(timestamp)
+                        value = int(item['value'])
+                        
+                        records.append({
+                            'date': date.strftime('%Y-%m-%d'),
+                            'fear_greed': value,
+                            'classification': item.get('value_classification', '')
+                        })
+                    
+                    # 创建DataFrame
+                    df = pd.DataFrame(records)
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                    df.sort_index(inplace=True)
+                    
+                    # 保存到缓存
+                    os.makedirs(os.path.dirname(self._sentiment_cache_file), exist_ok=True)
+                    df.to_csv(self._sentiment_cache_file)
+                    
+                    self.historical_sentiment = df
+                    logger.info(f"成功下载 {len(df)} 条历史恐贪指数数据")
+                else:
+                    logger.warning("API响应中没有数据")
+                    self._create_default_sentiment_data()
+                    
+        except Exception as e:
+            logger.error(f"下载历史恐贪指数失败: {e}")
+            self._create_default_sentiment_data()
+    
+    def _create_default_sentiment_data(self):
+        """创建默认的历史情绪数据（用于无法获取真实数据时）"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=730)
+        
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+        
+        # 使用随机游走生成模拟数据
+        np.random.seed(42)
+        values = [50]  # 起始值
+        
+        for _ in range(len(date_range) - 1):
+            # 随机游走，保持在0-100范围内
+            change = np.random.normal(0, 5)
+            new_value = values[-1] + change
+            new_value = max(0, min(100, new_value))
+            values.append(int(new_value))
+        
+        self.historical_sentiment = pd.DataFrame({
+            'fear_greed': values,
+            'classification': 'simulated'
+        }, index=date_range)
+        
+        logger.warning("使用模拟的历史情绪数据")
     
     def _ensure_data_availability(self):
         """确保所有币种的历史数据可用，如果缺失则自动下载"""
@@ -620,6 +720,48 @@ class EnhancedProductionML:
             logger.error(f"下载 {symbol} 小时数据失败: {e}")
             return False
     
+    def _update_historical_sentiment(self):
+        """更新历史情绪数据（添加最新数据）"""
+        try:
+            today = pd.Timestamp(datetime.now().date())
+            
+            # 检查是否已有今日数据
+            if not self.historical_sentiment.empty:
+                last_date = self.historical_sentiment.index[-1]
+                if last_date.date() >= today.date():
+                    return
+            
+            # 获取最新数据
+            url = "https://api.alternative.me/fng/"
+            params = {'limit': 1, 'format': 'json'}
+            
+            response = requests.get(url, params=params, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and len(data['data']) > 0:
+                    value = int(data['data'][0]['value'])
+                    classification = data['data'][0].get('value_classification', '')
+                    
+                    # 添加到历史数据
+                    new_data = pd.DataFrame({
+                        'fear_greed': [value],
+                        'classification': [classification]
+                    }, index=[today])
+                    
+                    self.historical_sentiment = pd.concat([
+                        self.historical_sentiment,
+                        new_data
+                    ])
+                    
+                    # 保存更新
+                    if self._sentiment_cache_file:
+                        self.historical_sentiment.to_csv(self._sentiment_cache_file)
+                    
+                    logger.debug(f"更新历史恐贪指数: {value} ({classification})")
+                    
+        except Exception as e:
+            logger.warning(f"更新历史情绪数据失败: {e}")
+    
     def _update_market_sentiment(self):
         """获取市场情绪指标（带重试机制）"""
         # 默认值（中性）
@@ -683,7 +825,7 @@ class EnhancedProductionML:
             self.sentiment_data['fear_greed'] = default_sentiment
             logger.info(f"恐贪指数获取失败，使用默认值: {default_sentiment}")
     
-    def _create_enhanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _create_enhanced_features(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:
         """
         创建增强特征（包含市场情绪）
         """
@@ -754,18 +896,30 @@ class EnhancedProductionML:
         features['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
         features['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
         
-        # 市场情绪特征（新增）
-        if self.sentiment_data.get('fear_greed'):
-            fear_greed_value = self.sentiment_data['fear_greed']['value']
-            features['fear_greed'] = fear_greed_value
-            features['sentiment_extreme'] = abs(fear_greed_value - 50) / 50  # 0-1范围
-            features['sentiment_bullish'] = 1 if fear_greed_value > 50 else 0
-            features['sentiment_bearish'] = 1 if fear_greed_value < 50 else 0
+        # 市场情绪特征（修复数据泄漏）
+        if is_training:
+            # 训练时：使用历史情绪数据
+            sentiment_features = self._merge_historical_sentiment_to_features(df)
+            for col in sentiment_features.columns:
+                features[col] = sentiment_features[col]
         else:
-            features['fear_greed'] = 50
-            features['sentiment_extreme'] = 0
-            features['sentiment_bullish'] = 0
-            features['sentiment_bearish'] = 0
+            # 预测时：使用实时情绪数据
+            if self.sentiment_data.get('fear_greed'):
+                fear_greed_value = self.sentiment_data['fear_greed']['value']
+                features['fear_greed'] = fear_greed_value
+                features['sentiment_extreme'] = abs(fear_greed_value - 50) / 50
+                features['sentiment_bullish'] = 1 if fear_greed_value > 50 else 0
+                features['sentiment_bearish'] = 1 if fear_greed_value < 50 else 0
+                # 添加情绪变化特征（使用最新值填充）
+                features['sentiment_change'] = 0  # 实时预测时无法计算变化率
+                features['sentiment_ma5'] = fear_greed_value  # 使用当前值
+            else:
+                features['fear_greed'] = 50
+                features['sentiment_extreme'] = 0
+                features['sentiment_bullish'] = 0
+                features['sentiment_bearish'] = 0
+                features['sentiment_change'] = 0
+                features['sentiment_ma5'] = 50
         
         # 时间特征
         features['day_of_week'] = df.index.dayofweek
@@ -797,6 +951,76 @@ class EnhancedProductionML:
                     features[col] = features[col].clip(lower, upper)
         
         return features
+    
+    def _merge_historical_sentiment_to_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """合并历史情绪数据到特征中（高性能版本）"""
+        sentiment_features = pd.DataFrame(index=df.index)
+        
+        if self.historical_sentiment.empty:
+            # 如果没有历史数据，使用默认值
+            sentiment_features['fear_greed'] = 50
+            sentiment_features['sentiment_extreme'] = 0
+            sentiment_features['sentiment_bullish'] = 0
+            sentiment_features['sentiment_bearish'] = 0
+            sentiment_features['sentiment_change'] = 0
+            sentiment_features['sentiment_ma5'] = 50
+            return sentiment_features
+        
+        # 高性能合并：使用 merge_asof 进行时间对齐
+        try:
+            # 准备价格数据的日期索引
+            price_df = pd.DataFrame(index=df.index).reset_index()
+            price_df['date'] = pd.to_datetime(price_df.iloc[:, 0].dt.date)
+            
+            # 准备历史情绪数据
+            sentiment_df = self.historical_sentiment.reset_index()
+            sentiment_df['date'] = pd.to_datetime(sentiment_df['date'])
+            
+            # 使用 merge_asof 进行时间对齐（向后填充）
+            merged = pd.merge_asof(
+                price_df.sort_values('date'),
+                sentiment_df.sort_values('date'),
+                on='date',
+                direction='backward'  # 使用历史数据
+            )
+            
+            # 处理缺失值
+            merged['fear_greed'] = merged['fear_greed'].fillna(50)
+            
+            # 设置回原索引
+            sentiment_features['fear_greed'] = merged['fear_greed'].values
+            
+        except Exception as e:
+            logger.warning(f"高性能合并失败，回退到安全模式: {e}")
+            # 回退到安全的重采样方法
+            daily_sentiment = self.historical_sentiment.resample('D').last().fillna(method='ffill')
+            
+            # 将每日情绪数据扩展到小时级别
+            df_dates = pd.to_datetime(df.index.date)
+            sentiment_values = []
+            for date in df_dates:
+                if date in daily_sentiment.index:
+                    sentiment_values.append(daily_sentiment.loc[date, 'fear_greed'])
+                else:
+                    # 查找最近的历史值
+                    mask = daily_sentiment.index <= date
+                    if mask.any():
+                        sentiment_values.append(daily_sentiment[mask].iloc[-1]['fear_greed'])
+                    else:
+                        sentiment_values.append(50)
+            
+            sentiment_features['fear_greed'] = sentiment_values
+        
+        # 衍生特征
+        sentiment_features['sentiment_extreme'] = np.abs(sentiment_features['fear_greed'] - 50) / 50
+        sentiment_features['sentiment_bullish'] = (sentiment_features['fear_greed'] > 50).astype(int)
+        sentiment_features['sentiment_bearish'] = (sentiment_features['fear_greed'] < 50).astype(int)
+        
+        # 情绪变化率
+        sentiment_features['sentiment_change'] = sentiment_features['fear_greed'].pct_change().fillna(0)
+        sentiment_features['sentiment_ma5'] = sentiment_features['fear_greed'].rolling(5, min_periods=1).mean()
+        
+        return sentiment_features
     
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
         """计算RSI"""
@@ -967,8 +1191,8 @@ class EnhancedProductionML:
             logger.warning(f"{symbol} 数据不足")
             return
         
-        # 创建特征
-        features = self._create_enhanced_features(df)
+        # 创建特征（训练模式）
+        features = self._create_enhanced_features(df, is_training=True)
         
         # 创建标签（改进的策略）
         labels = self._create_improved_labels(df, features)
@@ -978,21 +1202,29 @@ class EnhancedProductionML:
         features = features[valid_idx]
         labels = labels[valid_idx]
         
-        # 特征选择（保留前N个重要特征）
-        from sklearn.feature_selection import SelectKBest, f_classif
-        selector = SelectKBest(f_classif, k=min(self.config['n_features'], features.shape[1]))
-        features_selected = selector.fit_transform(features, labels)
-        selected_features = features.columns[selector.get_support()].tolist()
-        
-        # 保存选择的特征
-        self.selected_features[symbol] = selected_features
-        
-        # 时间序列分割
-        split_idx = int(len(features_selected) * (1 - self.config['test_size']))
-        X_train = features_selected[:split_idx]
-        X_test = features_selected[split_idx:]
+        # 时间序列分割（先分割，避免数据泄漏）
+        split_idx = int(len(features) * (1 - self.config['test_size']))
+        X_train_raw = features[:split_idx]
+        X_test_raw = features[split_idx:]
         y_train = labels[:split_idx].values
         y_test = labels[split_idx:].values
+        
+        # 特征选择（只在训练集上进行）
+        from sklearn.feature_selection import SelectKBest, f_classif
+        selector = SelectKBest(f_classif, k=min(self.config['n_features'], X_train_raw.shape[1]))
+        X_train = selector.fit_transform(X_train_raw, y_train)  # 仅在训练集上fit
+        X_test = selector.transform(X_test_raw)  # 应用到测试集
+        
+        # 保存特征选择器和特征名称
+        selected_features = X_train_raw.columns[selector.get_support()].tolist()
+        self.selected_features[symbol] = selected_features
+        
+        # 保存选择器（用于预测时应用相同的特征选择）
+        if not hasattr(self, 'feature_selectors'):
+            self.feature_selectors = {}
+        self.feature_selectors[symbol] = selector
+        
+        logger.info(f"{symbol} 选择了 {len(selected_features)} 个特征: {selected_features[:5]}...")  # 只显示前5个
         
         # 处理不平衡数据
         X_train_balanced, y_train_balanced = self._handle_imbalanced_data(X_train, y_train)
@@ -1358,7 +1590,9 @@ class EnhancedProductionML:
     
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """生成交易信号（带锁保护，训练时暂停）"""
-        self._update_market_sentiment()
+        # 更新情绪数据
+        self._update_historical_sentiment()  # 更新历史数据
+        self._update_market_sentiment()  # 获取实时数据
         # 如果正在训练，等待训练完成
         with self._training_lock:
             if symbol not in self.models:
@@ -1386,18 +1620,24 @@ class EnhancedProductionML:
             if len(df) < 100:
                 return None
             
-            # 创建特征
-            features = self._create_enhanced_features(df)
+            # 创建特征（预测模式）
+            features = self._create_enhanced_features(df, is_training=False)
             
-            # 应用特征选择（与训练时一致）
-            if symbol in self.selected_features:
+            # 应用特征选择（使用训练时的选择器，避免数据泄漏）
+            if hasattr(self, 'feature_selectors') and symbol in self.feature_selectors:
+                features_selected = self.feature_selectors[symbol].transform(features)
+                latest_features = features_selected[-1:] if len(features_selected) > 0 else None
+            elif symbol in self.selected_features:
+                # 回退方法：通过特征名称选择（兼容旧模型）
                 features = features[self.selected_features[symbol]]
+                latest_features = features.dropna().iloc[-1:].values
             else:
                 logger.error(f"Feature selection failed for {symbol}")
                 return None
             
-            # 获取最新特征
-            latest_features = features.dropna().iloc[-1:].values
+            if latest_features is None or len(latest_features) == 0:
+                logger.error(f"No valid features for {symbol}")
+                return None
             
             # 缩放
             latest_features_scaled = self.scalers[symbol].transform(latest_features)
@@ -1672,6 +1912,88 @@ class EnhancedProductionML:
         # 每小时输出一次当前UTC时间，方便调试
         if now.minute == 0 and now.second < 30:
             logger.info(f"当前UTC时间: {now.strftime('%Y-%m-%d %H:%M:%S')}, 等待12:00触发重训练")
+    
+    def validate_data_quality(self) -> Dict:
+        """验证数据质量（检查数据泄漏问题是否已修复）"""
+        issues = []
+        
+        # 检查历史情绪数据
+        if self.historical_sentiment.empty:
+            issues.append("缺少历史恐贪指数数据")
+        else:
+            # 检查数据完整性
+            date_range = pd.date_range(
+                start=self.historical_sentiment.index[0],
+                end=self.historical_sentiment.index[-1],
+                freq='D'
+            )
+            missing_dates = date_range.difference(self.historical_sentiment.index)
+            if len(missing_dates) > 30:  # 容忍少量缺失
+                issues.append(f"历史情绪数据缺失 {len(missing_dates)} 天")
+            
+            # 检查数据范围
+            invalid_values = self.historical_sentiment[
+                (self.historical_sentiment['fear_greed'] < 0) | 
+                (self.historical_sentiment['fear_greed'] > 100)
+            ]
+            if len(invalid_values) > 0:
+                issues.append(f"发现 {len(invalid_values)} 个无效情绪值")
+            
+            # 检查数据变化（避免所有值相同）
+            unique_values = self.historical_sentiment['fear_greed'].nunique()
+            if unique_values < 10:
+                issues.append(f"情绪数据变化太少，仅有 {unique_values} 个不同值")
+        
+        # 测试特征生成（检查训练模式是否正确）
+        test_passed = False
+        try:
+            # 创建测试数据
+            test_dates = pd.date_range(end=datetime.now(), periods=100, freq='H')
+            test_df = pd.DataFrame({
+                'open': np.random.rand(100) * 100,
+                'high': np.random.rand(100) * 100,
+                'low': np.random.rand(100) * 100,
+                'close': np.random.rand(100) * 100,
+                'volume': np.random.rand(100) * 1000
+            }, index=test_dates)
+            
+            # 测试训练模式
+            features_train = self._create_enhanced_features(test_df, is_training=True)
+            
+            # 检查情绪特征的变化
+            if 'fear_greed' in features_train.columns:
+                train_unique = features_train['fear_greed'].nunique()
+                if train_unique > 1:
+                    test_passed = True
+                else:
+                    issues.append("训练模式下情绪值没有变化（数据泄漏未修复）")
+            else:
+                issues.append("未找到情绪特征")
+                
+        except Exception as e:
+            issues.append(f"特征生成测试失败: {str(e)}")
+        
+        # 检查特征选择器是否正确保存
+        feature_selector_check = hasattr(self, 'feature_selectors') and len(self.feature_selectors) > 0
+        if not feature_selector_check:
+            issues.append("特征选择器未正确保存（可能仍存在数据泄漏）")
+        
+        return {
+            'is_valid': len(issues) == 0,
+            'issues': issues,
+            'test_passed': test_passed,
+            'feature_selector_check': feature_selector_check,
+            'historical_data_points': len(self.historical_sentiment),
+            'date_range': {
+                'start': str(self.historical_sentiment.index[0]) if not self.historical_sentiment.empty else None,
+                'end': str(self.historical_sentiment.index[-1]) if not self.historical_sentiment.empty else None
+            },
+            'unique_sentiment_values': self.historical_sentiment['fear_greed'].nunique() if not self.historical_sentiment.empty else 0,
+            'performance_optimizations': {
+                'sentiment_merge_optimized': 'merge_asof' in str(self._merge_historical_sentiment_to_features.__code__.co_names),
+                'feature_selection_fixed': feature_selector_check
+            }
+        }
     
     def get_all_signals(self) -> Dict:
         """获取所有信号（不重复更新数据）"""
