@@ -114,7 +114,7 @@ class EnhancedProductionML:
                 logger.info(f"从环境变量加载交易对: {self.symbols}")
             else:
                 # 使用默认值
-                self.symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'ADAUSDT']
+                self.symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'ADAUSDT', 'DOGEUSDT']
                 logger.info(f"使用默认交易对: {self.symbols}")
         
         # 模型配置
@@ -1236,10 +1236,18 @@ class EnhancedProductionML:
         
         self.scalers[symbol] = scaler
         
-        # 计算类权重
+        # 检查是否已经使用了SMOTE等采样方法
+        used_imbalance = self.config['handle_imbalance'] and IMBLEARN_AVAILABLE and \
+                         self.config['imbalance_strategy'] in ('smote', 'combine', 'undersample')
+        
+        # 只在未使用采样方法时才计算类权重
         classes = np.unique(y_train_balanced)
-        class_weights = compute_class_weight('balanced', classes=classes, y=y_train_balanced)
-        class_weight_dict = dict(zip(classes, class_weights))
+        if not used_imbalance:
+            class_weights = compute_class_weight('balanced', classes=classes, y=y_train_balanced)
+            class_weight_dict = dict(zip(classes, class_weights))
+        else:
+            # 已经使用了SMOTE，不需要类权重
+            class_weight_dict = {cls: 1.0 for cls in classes}
         
         # 训练多个模型
         models = {}
@@ -1259,7 +1267,7 @@ class EnhancedProductionML:
                     random_state=42,
                     objective='binary:logistic',
                     eval_metric='logloss',
-                    scale_pos_weight=float(class_weight_dict.get(1, 1.0)),
+                    scale_pos_weight=(float(class_weight_dict.get(1, 1.0)) if not used_imbalance else 1.0),
                     n_jobs=-1
                 )
             else:
@@ -1290,7 +1298,7 @@ class EnhancedProductionML:
                 bagging_fraction=0.8,
                 bagging_freq=5,
                 random_state=42,
-                class_weight='balanced',  # 自动平衡
+                class_weight=('balanced' if not used_imbalance else None),  # 只在未用SMOTE时平衡
                 n_jobs=-1,
                 verbosity=-1  # 静默模式，减少警告信息
             )
@@ -1305,7 +1313,7 @@ class EnhancedProductionML:
             max_depth=10,
             min_samples_split=5,
             min_samples_leaf=2,
-            class_weight='balanced',  # 处理不平衡
+            class_weight=('balanced' if not used_imbalance else None),  # 只在未用SMOTE时平衡
             random_state=42,
             n_jobs=-1
         )
@@ -1345,31 +1353,41 @@ class EnhancedProductionML:
     
     def _ensemble_predict(self, models: Dict, X: np.ndarray) -> np.ndarray:
         """集成预测（基于概率加权的argmax）"""
-        weights = {'xgboost': 0.35, 'lightgbm': 0.35, 'rf': 0.2, 'gb': 0.1}
+        weights = {'xgboost': 0.4, 'lightgbm': 0.4, 'rf': 0.2}  # 只保留实际存在的模型
         proba_sum = None
+        total_weight = 0.0
+        
         for name, model in models.items():
             proba = model.predict_proba(X)
             w = weights.get(name, 1.0 / max(1, len(models)))
+            total_weight += w
             proba = proba * w
             proba_sum = proba if proba_sum is None else (proba_sum + proba)
+        
+        # 归一化，确保权重总和为1
+        if total_weight > 0:
+            proba_sum = proba_sum / total_weight
+            
         return np.argmax(proba_sum, axis=1)
     
     def _ensemble_predict_proba(self, models: Dict, X: np.ndarray) -> np.ndarray:
         """集成预测概率"""
-        probabilities = []
-        weights = {
-            'xgboost': 0.35,
-            'lightgbm': 0.35,
-            'rf': 0.2,
-            'gb': 0.1
-        }
+        weights = {'xgboost': 0.4, 'lightgbm': 0.4, 'rf': 0.2}  # 只保留实际存在的模型
+        proba_sum = None
+        total_weight = 0.0
         
         for name, model in models.items():
             proba = model.predict_proba(X)
-            weight = weights.get(name, 1.0 / len(models))
-            probabilities.append(proba * weight)
+            w = weights.get(name, 1.0 / max(1, len(models)))
+            total_weight += w
+            proba = proba * w
+            proba_sum = proba if proba_sum is None else (proba_sum + proba)
         
-        return np.sum(probabilities, axis=0)
+        # 归一化，确保权重总和为1
+        if total_weight > 0:
+            proba_sum = proba_sum / total_weight
+            
+        return proba_sum
     
     def _save_models(self, symbol: str):
         """保存模型"""
