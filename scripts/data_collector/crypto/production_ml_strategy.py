@@ -188,12 +188,18 @@ class EnhancedProductionML:
             'paper_trading': True,
             'paper_balance': 10000,  # 初始资金
             'paper_fee': 0.001,  # 手续费0.1%
+            'slippage': float(os.getenv('ML_SLIPPAGE', '0.0005')),  # 滑点成本（默认0.05%）
+            'maker_fee': float(os.getenv('ML_MAKER_FEE', '0.0008')),  # Maker费用
+            'taker_fee': float(os.getenv('ML_TAKER_FEE', '0.001')),  # Taker费用
             
             # 风控参数
             'max_position_pct': 0.2,  # 最大仓位20%
             'stop_loss': 0.03,  # 止损3%
             'take_profit': 0.08,  # 止盈8%
             'min_confidence': 0.6,  # 最小置信度
+            'prediction_dead_zone': float(os.getenv('ML_DEAD_ZONE', '0.05')),  # 死区范围（概率差5%）
+            'min_holding_periods': int(os.getenv('ML_MIN_HOLDING_PERIODS', '4')),  # 最小持仓周期（小时）
+            'exclude_unclosed_bar': os.getenv('ML_EXCLUDE_UNCLOSED_BAR', 'true').lower() == 'true'  # 是否排除未收盘K线
             
             # 性能阈值
             'min_accuracy': float(os.getenv('ML_MIN_ACCURACY', '0.55')),
@@ -1478,9 +1484,16 @@ class EnhancedProductionML:
         # 计算收益（修复版）
         returns = df_valid['close'].pct_change()
         
-        # 考虑手续费
+        # 改进的交易成本计算
         trade_mask = positions != positions.shift(1)
-        fees = trade_mask.astype(float) * self.config['paper_fee']
+        
+        # 使用taker费用（更保守）+ 滑点
+        taker_fee = self.config.get('taker_fee', self.config['paper_fee'])
+        slippage = self.config.get('slippage', 0.0005)
+        total_cost = taker_fee + slippage
+        
+        # 应用交易成本
+        fees = trade_mask.astype(float) * total_cost
         
         # 策略收益 = 仓位 * 收益 - 手续费
         strategy_returns = positions.shift(1) * returns - fees
@@ -1638,12 +1651,33 @@ class EnhancedProductionML:
             if len(df) < 100:
                 return None
             
+            # 排除未收盘K线（如果配置要求）
+            if self.config.get('exclude_unclosed_bar', True):
+                # 检查最后一根K线是否已收盘（通过时间判断）
+                from datetime import datetime, timezone
+                current_time = datetime.now(timezone.utc)
+                last_bar_time = pd.to_datetime(df.index[-1])
+                
+                # 对于1小时K线，如果当前时间距离K线开始时间不足1小时，则排除
+                time_diff = (current_time.replace(tzinfo=None) - last_bar_time).total_seconds()
+                if time_diff < 3600:  # 小于1小时，说明K线未收盘
+                    logger.debug(f"Excluding unclosed bar for {symbol}, using previous bar")
+                    df = df[:-1]  # 排除最后一根K线
+                    if len(df) < 100:
+                        logger.error(f"Insufficient data after excluding unclosed bar for {symbol}")
+                        return None
+            
             # 创建特征（预测模式）
             features = self._create_enhanced_features(df, is_training=False)
             
             # 应用特征选择（使用训练时的选择器，避免数据泄漏）
             if hasattr(self, 'feature_selectors') and symbol in self.feature_selectors:
-                features_selected = self.feature_selectors[symbol].transform(features)
+                # 在transform前删除包含NaN的行
+                features_clean = features.dropna()
+                if len(features_clean) == 0:
+                    logger.error(f"All features contain NaN for {symbol}")
+                    return None
+                features_selected = self.feature_selectors[symbol].transform(features_clean)
                 latest_features = features_selected[-1:] if len(features_selected) > 0 else None
             elif symbol in self.selected_features:
                 # 回退方法：通过特征名称选择（兼容旧模型）
@@ -1671,6 +1705,13 @@ class EnhancedProductionML:
                 # 二分类映射
                 signal_map = {0: 'SELL', 1: 'BUY'}
                 recommendation = signal_map[prediction]
+                
+                # 应用死区过滤（减少震荡市场的过度交易）
+                dead_zone = self.config.get('prediction_dead_zone', 0.05)
+                prob_diff = abs(probabilities[1] - 0.5)
+                if prob_diff < dead_zone:  # 概率接近0.5，不确定性高
+                    logger.debug(f"Signal in dead zone for {symbol} (prob_diff={prob_diff:.3f}), keeping current position")
+                    recommendation = 'HOLD'  # 保持当前仓位
             else:
                 # 三分类映射
                 signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
@@ -1745,6 +1786,30 @@ class EnhancedProductionML:
             
             # 确保置信度在合理范围内
             confidence = max(0.1, min(0.95, confidence))
+            
+            # 7. 应用最小置信度过滤
+            original_recommendation = recommendation  # 保存原始推荐
+            min_confidence_threshold = self.config.get('min_confidence', 0.6)
+            if confidence < min_confidence_threshold and recommendation != 'HOLD':
+                logger.debug(f"Confidence {confidence:.2f} below threshold {min_confidence_threshold} for {symbol}, changing to HOLD")
+                recommendation = 'HOLD'  # 置信度不足，保持当前仓位
+                
+                # 记录原始推荐供分析
+                ai_prediction = f"{original_recommendation} (filtered due to low confidence)"
+            
+            # 8. 检查最小持仓时间（如果有上次交易记录）
+            min_holding = self.config.get('min_holding_periods', 4)
+            if hasattr(self, 'last_trade_time') and symbol in self.last_trade_time:
+                hours_since_last_trade = (datetime.now() - self.last_trade_time[symbol]).total_seconds() / 3600
+                if hours_since_last_trade < min_holding and recommendation != 'HOLD':
+                    logger.debug(f"Min holding period not met for {symbol} ({hours_since_last_trade:.1f}h < {min_holding}h), holding position")
+                    recommendation = 'HOLD'
+            
+            # 记录交易时间（如果产生新信号）
+            if recommendation != 'HOLD':
+                if not hasattr(self, 'last_trade_time'):
+                    self.last_trade_time = {}
+                self.last_trade_time[symbol] = datetime.now()
             
             # 风险评估
             volatility = float(df['close'].pct_change().rolling(20).std().iloc[-1])
