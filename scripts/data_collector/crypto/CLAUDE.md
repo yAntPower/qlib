@@ -220,6 +220,13 @@ Note: 40% accuracy on 3-class problem is better than random (33.3%).
 
 ## Development Notes
 
+### Important: Mode Isolation Principle
+- **When modifying for okx_strategy remote mode**: Only modify qlib-related signal generation logic
+- **When modifying for okx_strategy local mode**: Do NOT modify qlib code at all
+- **Signal format consistency**: Always maintain the same signal format for WebSocket/HTTP communication
+- **Independence**: qlib project should work independently without depending on specific okx_strategy implementation
+
+### Critical Guidelines
 - **CRITICAL**: Always use virtual environment `/home/ant/project/.venv/bin/python3`
 - Always check if models exist before generating signals
 - Use `logger` for debugging (configured with loguru)

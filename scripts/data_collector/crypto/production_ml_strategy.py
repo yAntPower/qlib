@@ -166,7 +166,7 @@ class EnhancedProductionML:
             'test_size': float(os.getenv('ML_TEST_RATIO', '0.2')),
             'validation_ratio': float(os.getenv('ML_VALIDATION_RATIO', '0.1')),
             'n_features': 60,  # 增加特征数量
-            'prediction_horizon': 1,
+            'prediction_horizon': 3,
             
             # 标签生成策略 - 从环境变量读取
             'label_strategy': os.getenv('ML_LABEL_STRATEGY', 'adaptive'),
@@ -199,7 +199,7 @@ class EnhancedProductionML:
             'min_confidence': 0.6,  # 最小置信度
             'prediction_dead_zone': float(os.getenv('ML_DEAD_ZONE', '0.05')),  # 死区范围（概率差5%）
             'min_holding_periods': int(os.getenv('ML_MIN_HOLDING_PERIODS', '4')),  # 最小持仓周期（小时）
-            'exclude_unclosed_bar': os.getenv('ML_EXCLUDE_UNCLOSED_BAR', 'true').lower() == 'true'  # 是否排除未收盘K线
+            'exclude_unclosed_bar': os.getenv('ML_EXCLUDE_UNCLOSED_BAR', 'true').lower() == 'true',  # 是否排除未收盘K线
             
             # 性能阈值
             'min_accuracy': float(os.getenv('ML_MIN_ACCURACY', '0.55')),
