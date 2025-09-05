@@ -21,13 +21,13 @@ This is a cryptocurrency trading strategy system built on Microsoft Qlib framewo
 # ALWAYS use virtual environment
 cd /home/ant/project/qlib/scripts/data_collector/crypto
 
+# AutoGluon+River Strategy (RECOMMENDED - port 8091)
+/home/ant/project/.venv/bin/python3 autogluon_river_strategy.py --websocket
+
 # Technical Analysis Strategy (port 8080)
-/home/ant/project/.venv/bin/python3 enhanced_binance_starter.py
+/home/ant/project/.venv/bin/python3 binance_analyzer_starter.py full --start-date 2023-01-01 --limit-nums 20 --update-interval 30
 
-# ML Strategy - Basic (port 8090)
-/home/ant/project/.venv/bin/python3 ml_strategy_analyzer.py
-
-# Production ML Strategy (port 8091)
+# Production ML Strategy (Legacy - port 8091)
 /home/ant/project/.venv/bin/python3 production_ml_strategy.py          # Daily data
 /home/ant/project/.venv/bin/python3 production_ml_strategy.py --hourly  # Hourly data
 ```
@@ -43,6 +43,13 @@ cd /home/ant/project/qlib/scripts/data_collector/crypto
 
 # Convert data format
 /home/ant/project/.venv/bin/python3 binance_dump_bin.py --symbol BTCUSDT
+
+# Force re-download all hourly data (complete historical data from 2021)
+/home/ant/project/.venv/bin/python3 -c "
+from production_ml_strategy import EnhancedProductionML
+ml = EnhancedProductionML(use_hourly_data=True)
+ml.force_download_all_hourly_data()  # Download ~40,000 hourly records per symbol
+"
 ```
 
 ### Testing & Validation
@@ -60,18 +67,23 @@ curl http://localhost:8091/metrics
 ### Integrated System with OKX
 
 ```bash
-# Start integrated system (ML strategy + OKX execution)
+# Start integrated system with AutoGluon+River (RECOMMENDED)
 cd /home/ant/project/okx_strategy
-./scripts/start_integrated_system.sh --strategy hourly
+./scripts/start_integrated_system.sh --strategy autogluon
 
-# Stop system
+# Alternative strategies
+./scripts/start_integrated_system.sh --strategy hourly      # Production ML with hourly data
+./scripts/start_integrated_system.sh --strategy technical  # Technical analysis
+
+# System management
 ./scripts/start_integrated_system.sh stop
-
-# Restart system
 ./scripts/start_integrated_system.sh restart
-
-# Check status
 ./scripts/start_integrated_system.sh status
+
+# Data and model management
+./scripts/start_integrated_system.sh download-data  # Re-download all hourly data
+./scripts/start_integrated_system.sh retrain       # Retrain all models
+./scripts/start_integrated_system.sh retrain-all   # Download data + retrain
 ```
 
 ### Environment Variables for Strategy Configuration
@@ -110,9 +122,9 @@ export ML_DOWN_THRESHOLD=-0.004
    - Stores in `~/.qlib/binance_simple_data/` (daily) and `~/.qlib/binance_hourly_data/` (hourly)
 
 2. **Strategy Layer**
-   - `enhanced_binance_starter.py`: Pure technical indicators (RSI, MACD, Bollinger Bands)
-   - `ml_strategy_analyzer.py`: Basic RandomForest ML model
-   - `production_ml_strategy.py`: Advanced ensemble ML (XGBoost + LightGBM + RF + GradientBoosting)
+   - `autogluon_river_strategy.py`: AutoGluon AutoML + River online learning (RECOMMENDED)
+   - `binance_analyzer_starter.py`: Pure technical indicators (RSI, MACD, Bollinger Bands)
+   - `production_ml_strategy.py`: Legacy ensemble ML (XGBoost + LightGBM + RF + GradientBoosting)
 
 3. **Feature Engineering** (in `production_ml_strategy.py`)
    - `_create_enhanced_features()`: 100+ technical indicators
@@ -120,11 +132,24 @@ export ML_DOWN_THRESHOLD=-0.004
    - Automatic feature selection using SelectKBest (top 60 features)
 
 4. **Model Management**
-   - Production models: `~/.qlib/production_ml_models/` (binary classification)
-   - Hourly models: `~/.qlib/hourly_models/`
-   - Includes ensemble models, scalers, feature selectors
+   - AutoGluon models: `~/.qlib/autogluon_models/` (AutoML models)
+   - River models: `~/.qlib/river_models/` (Online learning models)
+   - Legacy production models: `~/.qlib/production_ml_models/` (binary classification)
    - Auto-retraining: Daily at UTC 12:00 (Beijing 20:00)
    - Performance monitoring with metrics tracking
+
+5. **Data Storage Paths**
+   - **Source data (raw)**: 
+     - Daily: `~/.qlib/binance_simple_data/*.csv`
+     - Hourly: `~/.qlib/binance_hourly_data/*.csv` (40,000+ records per symbol from 2021)
+   - **Trained models**: 
+     - `~/.qlib/autogluon_models/` - AutoGluon AutoML models
+     - `~/.qlib/river_models/` - River online learning models
+     - `~/.qlib/production_ml_models/` - Legacy ensemble models
+   - **Model files**: 
+     - AutoGluon: `{SYMBOL}_autogluon/` directories
+     - River: `{SYMBOL}_river_model.pkl`
+     - Legacy: `{SYMBOL}_model.pkl`, `{SYMBOL}_scaler.pkl`, `{SYMBOL}_features.pkl`
 
 5. **HTTP API Service**
    - Flask-based REST API on ports 8080/8090/8091
@@ -236,6 +261,12 @@ Note: 40% accuracy on 3-class problem is better than random (33.3%).
 - Binary classification mode is used in production (BUY/SELL only, no HOLD)
 - Label strategy: percentile (70/30) for production
 
+## Log File Locations
+
+- **Main qlib analyzer log**: `/tmp/qlib_analyzer.log` - WebSocket server and signal generation
+- **Enhanced ML strategy log**: `/tmp/enhanced_production_ml.log` - Detailed ML model training and predictions
+- **OKX integration logs**: See `/home/ant/project/okx_strategy/logs/strategy_*.log`
+
 ## Common Issues & Solutions
 
 1. **Port already in use**: Check with `lsof -i:PORT` and kill existing process
@@ -249,9 +280,95 @@ Note: 40% accuracy on 3-class problem is better than random (33.3%).
 
 ```bash
 cd /home/ant/project/qlib/scripts/data_collector/crypto
+
+# AutoGluon+River strategy (RECOMMENDED)
 /home/ant/project/.venv/bin/python3 -c "
-from production_ml_strategy import ProductionMLStrategy
-ml = ProductionMLStrategy(use_hourly_data=True)
+from autogluon_river_strategy import AutoGluonRiverStrategy
+ml = AutoGluonRiverStrategy(use_hourly_data=True)
+ml.retrain_all_models()
+"
+
+# Legacy production strategy
+/home/ant/project/.venv/bin/python3 -c "
+from production_ml_strategy import EnhancedProductionML
+ml = EnhancedProductionML(use_hourly_data=True)
 ml.retrain_all_models()
 "
 ```
+
+## 2025-09 重要更新：AutoGluon+River集成
+
+### 核心变化
+系统已简化为使用AutoGluon+River组合，删除了复杂的CatBoost和其他旧模型代码。
+
+### 新增文件
+1. **autogluon_river_strategy.py** - AutoGluon+River集成策略
+   - AutoGluon自动机器学习（离线批训练）
+   - River在线学习（实时模型更新）
+   - 专为i5-7700 + 16GB RAM + GTX 1060配置优化
+   - 支持WebSocket通信和HTTP API
+
+### 已删除的文件（简化系统）
+- `crypto_enhanced_features.py` - 移除复杂特征工程
+- `crypto_advanced_models.py` - 移除CatBoost等高级模型
+- `enhanced_crypto_ml_strategy.py` - 移除增强集成策略
+- `crypto_automl_strategy.py` - 移除旧的AutoML实现
+- 所有CatBoost相关配置和脚本文件
+
+### 依赖更新
+```bash
+pip install river       # v0.22.0，在线学习核心库
+pip install autogluon   # 自动机器学习（已安装）
+# 不再需要：catboost, TA-Lib等复杂依赖
+```
+
+### 配置参数调整
+- `ML_MIN_CONFIDENCE=0.45` (从0.55降低)
+- `ML_DEAD_ZONE=0.005` (从0.01降低)
+- 更激进的信号生成策略，适合AutoGluon的自动优化特性
+
+## Data Download and Management
+
+### Force Re-download Complete Historical Data
+
+When data is incomplete or corrupted, use the force download function:
+
+```bash
+cd /home/ant/project/qlib/scripts/data_collector/crypto
+
+# AutoGluon+River strategy (RECOMMENDED)
+/home/ant/project/.venv/bin/python3 -c "
+from autogluon_river_strategy import AutoGluonRiverStrategy
+import logging
+logging.basicConfig(level=logging.INFO)
+
+ml = AutoGluonRiverStrategy(use_hourly_data=True)
+
+# Force download all historical data (2021-present)
+ml.force_download_all_hourly_data()
+
+# Then retrain models with new data
+ml.retrain_all_models()
+"
+
+# Legacy production strategy
+/home/ant/project/.venv/bin/python3 -c "
+from production_ml_strategy import EnhancedProductionML
+import logging
+logging.basicConfig(level=logging.INFO)
+
+ml = EnhancedProductionML(use_hourly_data=True)
+ml.force_download_all_hourly_data()
+ml.retrain_all_models()
+"
+```
+
+### Data Specifications
+
+- **Training data volume**: ~40,000 hourly records per symbol (4+ years from 2021)
+- **SMOTE balancing**: Reduces to ~33,000 samples after 80/20 train/test split and class balancing
+- **Special handling for new tokens**:
+  - SUI: Data from 2023-05-03 (launch date)
+  - Other major tokens: Data from 2021-01-01
+- **Download batch size**: 1000 records per API call
+- **Complete download time**: ~2-3 minutes per symbol

@@ -1,11 +1,33 @@
 #!/usr/bin/env python3
 """
-增强版生产级ML策略
+增强版生产级ML策略 (EnhancedProductionML)
+
+主要功能：
 - 修复回测bug
 - 改进标签生成
-- 处理不平衡数据
+- 处理不平衡数据（SMOTE）
 - 添加市场情绪
 - 纸上交易系统
+- 完整历史数据下载（2021年至今，40,000+条/币种）
+
+数据路径：
+- 源数据: ~/.qlib/binance_hourly_data/*.csv
+- 模型: ~/.qlib/production_ml_models/{SYMBOL}_model.pkl
+- 特征: ~/.qlib/production_ml_models/{SYMBOL}_features.pkl
+- 缩放器: ~/.qlib/production_ml_models/{SYMBOL}_scaler.pkl
+
+关键方法：
+- force_download_all_hourly_data(): 强制重新下载所有历史数据
+- retrain_all_models(): 重新训练所有模型
+- _download_hourly_data(symbol): 下载单个币种的完整历史数据
+
+使用示例：
+```python
+from production_ml_strategy import EnhancedProductionML
+ml = EnhancedProductionML(use_hourly_data=True)
+ml.force_download_all_hourly_data()  # 下载完整数据
+ml.retrain_all_models()  # 训练模型
+```
 """
 
 import os
@@ -238,12 +260,27 @@ class EnhancedProductionML:
         try:
             if os.path.exists(self._sentiment_cache_file):
                 # 加载已有的历史数据
-                self.historical_sentiment = pd.read_csv(
-                    self._sentiment_cache_file,
-                    index_col='date',
-                    parse_dates=True
-                )
-                logger.info(f"加载历史情绪数据: {len(self.historical_sentiment)} 条记录")
+                try:
+                    # 先尝试读取文件查看结构
+                    temp_df = pd.read_csv(self._sentiment_cache_file)
+                    if 'date' in temp_df.columns:
+                        self.historical_sentiment = pd.read_csv(
+                            self._sentiment_cache_file,
+                            index_col='date',
+                            parse_dates=True
+                        )
+                    else:
+                        # 如果没有date列，尝试用第一列作为索引
+                        self.historical_sentiment = pd.read_csv(
+                            self._sentiment_cache_file,
+                            index_col=0,
+                            parse_dates=True
+                        )
+                    logger.info(f"加载历史情绪数据: {len(self.historical_sentiment)} 条记录")
+                except Exception as inner_e:
+                    logger.warning(f"读取情绪数据文件失败: {inner_e}，将重新下载")
+                    os.remove(self._sentiment_cache_file)
+                    self._download_historical_sentiment()
             else:
                 # 下载历史数据
                 self._download_historical_sentiment()
@@ -523,11 +560,16 @@ class EnhancedProductionML:
             
             if not os.path.exists(file_path):
                 logger.warning(f"小时数据不存在: {file_path}")
-                logger.info(f"回退到日线数据: {symbol}")
-                # 回退到日线数据
-                file_path = os.path.join(self.data_dir, f"{symbol}.csv")
+                logger.info(f"开始下载 {symbol} 的小时数据...")
+                # 下载小时数据
+                self._download_hourly_data(symbol)
+                # 重新设置文件路径
+                file_path = os.path.join(self.hourly_data_dir, f"{symbol}.csv")
                 if not os.path.exists(file_path):
-                    file_path = os.path.join(self.data_dir, f"{symbol}_1d.csv")
+                    logger.info(f"回退到日线数据: {symbol}")
+                    file_path = os.path.join(self.data_dir, f"{symbol}.csv")
+                    if not os.path.exists(file_path):
+                        file_path = os.path.join(self.data_dir, f"{symbol}_1d.csv")
             else:
                 logger.debug(f"使用小时数据: {symbol}")
         else:
@@ -624,9 +666,9 @@ class EnhancedProductionML:
             
             logger.info(f"正在下载 {symbol} 小时数据...")
             
-            # 计算时间范围：从2023年1月1日开始（约2年数据）
+            # 计算时间范围：从2021年1月1日开始（约4年数据）
             end_date = datetime.now()
-            start_date = datetime(2023, 1, 1)  # 从2023年开始，数据更充分
+            start_date = datetime(2021, 1, 1)  # 从2021年开始，获取更多历史数据
             
             # 特殊处理新币种的上线时间
             special_start_dates = {
@@ -634,6 +676,9 @@ class EnhancedProductionML:
                 'APTUSDT': datetime(2022, 10, 19),  # APT 2022年10月上线
                 'ARBUSDT': datetime(2023, 3, 23),  # ARB 2023年3月上线
                 'OPUSDT': datetime(2022, 6, 1),   # OP 2022年6月上线
+                'SOLUSDT': datetime(2020, 4, 10),  # SOL 2020年4月上线Binance
+                'ADAUSDT': datetime(2018, 4, 1),   # ADA 早期币种，数据充足
+                'DOGEUSDT': datetime(2019, 7, 5),  # DOGE 2019年7月上线Binance
             }
             
             if symbol in special_start_dates:
@@ -676,7 +721,11 @@ class EnhancedProductionML:
                     if data:
                         all_data.extend(data)
                         batch_count += 1
-                        logger.info(f"  批次{batch_count}: 获取 {len(data)} 条记录 ({current_start.strftime('%Y-%m-%d %H:%M')} - {current_end.strftime('%Y-%m-%d %H:%M')})")
+                        # 每10批次显示一次进度，减少日志输出
+                        if batch_count % 10 == 1 or batch_count == 1:
+                            logger.info(f"  批次{batch_count}: 获取 {len(data)} 条记录 ({current_start.strftime('%Y-%m-%d')} - {current_end.strftime('%Y-%m-%d')})")
+                        elif batch_count % 10 == 0:
+                            logger.info(f"  已下载 {batch_count} 批次，共 {len(all_data)} 条记录...")
                         
                         # 从最后一条数据的时间戳+1小时开始下一批次（避免重复）
                         last_timestamp = data[-1][0]
@@ -688,8 +737,10 @@ class EnhancedProductionML:
                     time.sleep(0.2)  # 避免频率限制
                     
                 except Exception as e:
-                    logger.warning(f"  批次下载失败: {e}，跳过...")
-                    current_start = current_end
+                    logger.warning(f"  批次{batch_count+1} 下载失败: {e}，重试...")
+                    time.sleep(1)  # 等待1秒后重试
+                    # 移动到下一个批次起点
+                    current_start = current_end + timedelta(hours=1)
                     continue
             
             if not all_data:
@@ -725,6 +776,48 @@ class EnhancedProductionML:
         except Exception as e:
             logger.error(f"下载 {symbol} 小时数据失败: {e}")
             return False
+    
+    def force_download_all_hourly_data(self):
+        """
+        强制重新下载所有币种的完整小时数据
+        用于初始化或数据修复
+        """
+        logger.info("=" * 60)
+        logger.info("开始强制下载所有币种的完整历史数据")
+        logger.info("=" * 60)
+        
+        success_count = 0
+        failed_symbols = []
+        
+        for symbol in self.symbols:
+            logger.info(f"\n正在处理 {symbol}...")
+            
+            # 删除旧数据文件
+            file_path = os.path.join(self.hourly_data_dir, f"{symbol}.csv")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"  已删除旧数据文件: {file_path}")
+            
+            # 下载新数据
+            if self._download_hourly_data(symbol):
+                success_count += 1
+                
+                # 验证下载的数据
+                if os.path.exists(file_path):
+                    df = pd.read_csv(file_path)
+                    logger.info(f"  ✅ {symbol} 下载成功: {len(df)} 条记录")
+                    logger.info(f"     数据范围: {df['date'].min()} 到 {df['date'].max()}")
+            else:
+                failed_symbols.append(symbol)
+                logger.error(f"  ❌ {symbol} 下载失败")
+        
+        logger.info("\n" + "=" * 60)
+        logger.info(f"下载完成: 成功 {success_count}/{len(self.symbols)} 个币种")
+        if failed_symbols:
+            logger.error(f"失败的币种: {', '.join(failed_symbols)}")
+        logger.info("=" * 60)
+        
+        return success_count == len(self.symbols)
     
     def _update_historical_sentiment(self):
         """更新历史情绪数据（添加最新数据）"""
@@ -976,7 +1069,14 @@ class EnhancedProductionML:
         try:
             # 准备价格数据的日期索引
             price_df = pd.DataFrame(index=df.index).reset_index()
-            price_df['date'] = pd.to_datetime(price_df.iloc[:, 0].dt.date)
+            # 修复：正确处理索引名称
+            if price_df.columns[0] == 'index':
+                price_df.rename(columns={'index': 'datetime'}, inplace=True)
+            # 确保datetime列存在并转换为日期
+            if 'datetime' in price_df.columns:
+                price_df['date'] = pd.to_datetime(price_df['datetime'].dt.date)
+            else:
+                price_df['date'] = pd.to_datetime(price_df.iloc[:, 0]).dt.date
             
             # 准备历史情绪数据
             sentiment_df = self.historical_sentiment.reset_index()
@@ -1327,6 +1427,28 @@ class EnhancedProductionML:
         models['rf'] = rf_model
         scores['rf'] = rf_model.score(X_test_scaled, y_test)
         
+        # CatBoost（如果可用）
+        try:
+            from catboost import CatBoostClassifier
+            logger.info("训练CatBoost...")
+            catboost_model = CatBoostClassifier(
+                iterations=200,
+                depth=6,
+                learning_rate=0.05,
+                random_state=42,
+                verbose=False,
+                task_type='CPU',
+                auto_class_weights=('Balanced' if not used_imbalance else None)
+            )
+            catboost_model.fit(X_train_scaled, y_train_balanced)
+            models['catboost'] = catboost_model
+            scores['catboost'] = catboost_model.score(X_test_scaled, y_test)
+            logger.info(f"CatBoost准确率: {scores['catboost']:.4f}")
+        except ImportError:
+            logger.debug("CatBoost未安装，跳过CatBoost训练")
+        except Exception as e:
+            logger.warning(f"CatBoost训练失败: {e}")
+        
         # 保存模型
         self.models[symbol] = models
         
@@ -1414,8 +1536,60 @@ class EnhancedProductionML:
                 json.dump(self.model_metrics[symbol], f, indent=2)
             
             logger.info(f"模型已保存: {symbol}")
+            
+            # 按模型类型单独保存（便于管理和调试）
+            self._save_models_by_type(symbol)
+            
         except Exception as e:
             logger.error(f"保存模型失败: {e}")
+    
+    def _save_models_by_type(self, symbol: str):
+        """按模型类型组织存储目录"""
+        try:
+            base_models_dir = os.path.join(os.path.dirname(self.model_dir), "models")
+            
+            # 为每个模型类型创建目录
+            model_types = {
+                'xgboost': 'xgboost',
+                'lightgbm': 'lightgbm', 
+                'rf': 'randomforest',
+                'catboost': 'catboost'
+            }
+            
+            for model_key, folder_name in model_types.items():
+                if model_key in self.models[symbol]:
+                    model_dir = os.path.join(base_models_dir, folder_name)
+                    os.makedirs(model_dir, exist_ok=True)
+                    
+                    # 保存模型
+                    model_file = os.path.join(model_dir, f"{symbol}_model.pkl")
+                    joblib.dump(self.models[symbol][model_key], model_file)
+                    
+                    # 保存scaler
+                    scaler_file = os.path.join(model_dir, f"{symbol}_scaler.pkl")
+                    if hasattr(self, 'scalers') and symbol in self.scalers:
+                        joblib.dump(self.scalers[symbol], scaler_file)
+                    
+                    # 保存特征列表
+                    if hasattr(self, 'selected_features') and symbol in self.selected_features:
+                        features_file = os.path.join(model_dir, f"{symbol}_features.pkl")
+                        joblib.dump(self.selected_features[symbol], features_file)
+                    
+                    # 保存模型特定的性能指标
+                    metrics = {
+                        'accuracy': self.models[symbol].get(f'{model_key}_accuracy', 0),
+                        'trained_at': datetime.now().isoformat(),
+                        'symbol': symbol,
+                        'model_type': folder_name
+                    }
+                    metrics_file = os.path.join(model_dir, f"{symbol}_metrics.json")
+                    with open(metrics_file, 'w') as f:
+                        json.dump(metrics, f, indent=2)
+                    
+                    logger.debug(f"已保存 {symbol} 的 {folder_name} 模型到 {model_dir}")
+                    
+        except Exception as e:
+            logger.warning(f"按类型保存模型失败: {e}")
     
     def backtest_fixed(self, symbol: str, start_date: Optional[str] = None) -> Dict:
         """
