@@ -553,7 +553,30 @@ class AutoGluonRiverStrategy:
             # 集成预测
             final_prediction = int(np.mean(predictions) > 0.5)
             final_confidence = np.mean(confidences)
-            
+
+            # 添加市场趋势判断来平衡买卖信号
+            close_price = df['close'].iloc[-1]
+            sma_20 = df['close'].rolling(20).mean().iloc[-1]
+            sma_50 = df['close'].rolling(50).mean().iloc[-1] if len(df) > 50 else sma_20
+            # 从特征中获取RSI值
+            rsi = features['rsi'].iloc[-1] if 'rsi' in features.columns else 50.0
+
+            # 市场趋势调整
+            trend_bias = 0
+            if close_price > sma_20 and sma_20 > sma_50:
+                trend_bias = 0.15  # 上升趋势，增加买入倾向
+            elif close_price < sma_20 and sma_20 < sma_50:
+                trend_bias = -0.15  # 下降趋势，增加卖出倾向
+
+            # RSI超卖超买调整
+            if rsi < 30:
+                trend_bias += 0.2  # 超卖，增加买入倾向
+            elif rsi > 70:
+                trend_bias -= 0.2  # 超买，增加卖出倾向
+
+            # 调整后的预测概率
+            adjusted_buy_prob = np.mean(predictions) + trend_bias
+
             # 应用死区逻辑
             if abs(final_confidence - 0.5) < self.dead_zone:
                 recommendation = 'HOLD'
@@ -562,8 +585,16 @@ class AutoGluonRiverStrategy:
                 recommendation = 'HOLD'
                 reason = f'置信度不足 ({final_confidence:.2%} < {self.min_confidence:.2%})'
             else:
-                recommendation = 'BUY' if final_prediction == 1 else 'SELL'
-                reason = f'模型预测 ({len(predictions)}个模型投票)'
+                # 使用调整后的概率决定买卖
+                if adjusted_buy_prob > 0.5:
+                    recommendation = 'BUY'
+                    reason = f'模型+趋势预测买入 (调整概率: {adjusted_buy_prob:.2f})'
+                elif adjusted_buy_prob < 0.5:
+                    recommendation = 'SELL'
+                    reason = f'模型+趋势预测卖出 (调整概率: {adjusted_buy_prob:.2f})'
+                else:
+                    recommendation = 'HOLD'
+                    reason = '概率中性，持有观望'
             
             # 在线学习：使用历史数据更新River模型
             if len(df) > 50:
