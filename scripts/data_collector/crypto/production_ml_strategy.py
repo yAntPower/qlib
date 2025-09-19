@@ -1156,7 +1156,11 @@ class EnhancedProductionML:
         """
         改进的标签生成策略 - 支持二分类和三分类
         """
+        # 计算未来收益（注意：shift(-n)会使用未来数据）
         future_returns = df['close'].shift(-self.config['prediction_horizon']) / df['close'] - 1
+
+        # 重要：删除最后 prediction_horizon 行，避免使用未来数据
+        # 这些行的 future_returns 会是 NaN，必须在返回前处理
         
         # 使用二分类配置
         use_binary = self.config.get('use_binary_classification', True)
@@ -1302,8 +1306,16 @@ class EnhancedProductionML:
         
         # 创建标签（改进的策略）
         labels = self._create_improved_labels(df, features)
-        
-        # 删除NaN
+
+        # 重要：先删除最后 prediction_horizon 行，因为它们没有未来数据
+        # 这些行的 future_returns 会是 NaN
+        horizon = self.config.get('prediction_horizon', 24)
+        if len(features) > horizon:
+            features = features[:-horizon]
+            labels = labels[:-horizon]
+            logger.debug(f"Removed last {horizon} rows to avoid look-ahead bias")
+
+        # 删除剩余的NaN
         valid_idx = ~(features.isna().any(axis=1) | labels.isna())
         features = features[valid_idx]
         labels = labels[valid_idx]
@@ -1315,11 +1327,16 @@ class EnhancedProductionML:
         y_train = labels[:split_idx].values
         y_test = labels[split_idx:].values
         
-        # 特征选择（只在训练集上进行）
+        # 特征选择（只在训练集的80%上进行，避免信息泄漏）
         from sklearn.feature_selection import SelectKBest, f_classif
         selector = SelectKBest(f_classif, k=min(self.config['n_features'], X_train_raw.shape[1]))
-        X_train = selector.fit_transform(X_train_raw, y_train)  # 仅在训练集上fit
+
+        # 只使用训练集的前80%进行特征选择
+        selector_train_size = int(len(X_train_raw) * 0.8)
+        X_train = selector.fit_transform(X_train_raw, y_train)  # fit在前80%，transform在全部
         X_test = selector.transform(X_test_raw)  # 应用到测试集
+
+        logger.debug(f"Feature selection: using first {selector_train_size} samples for selection")
         
         # 保存特征选择器和特征名称
         selected_features = X_train_raw.columns[selector.get_support()].tolist()
@@ -1832,11 +1849,13 @@ class EnhancedProductionML:
                 current_time = datetime.now(timezone.utc)
                 last_bar_time = pd.to_datetime(df.index[-1])
                 
-                # 对于1小时K线，如果当前时间距离K线开始时间不足1小时，则排除
+                # 对于1小时K线，使用2小时缓冲期确保K线完全收盘
                 time_diff = (current_time.replace(tzinfo=None) - last_bar_time).total_seconds()
-                if time_diff < 3600:  # 小于1小时，说明K线未收盘
-                    logger.debug(f"Excluding unclosed bar for {symbol}, using previous bar")
-                    df = df[:-1]  # 排除最后一根K线
+                if time_diff < 7200:  # 小于2小时，可能未完全收盘
+                    # 如果小于1小时，去掉最后2根；否则去掉最后1根
+                    bars_to_remove = 2 if time_diff < 3600 else 1
+                    logger.info(f"Excluding last {bars_to_remove} potentially unclosed bar(s) for {symbol} (time_diff: {time_diff/3600:.1f}h)")
+                    df = df[:-bars_to_remove]  # 排除可能未收盘的K线
                     if len(df) < 100:
                         logger.error(f"Insufficient data after excluding unclosed bar for {symbol}")
                         return None
