@@ -112,13 +112,22 @@ class AutoGluonRiverStrategy:
         self._feature_version = {}  # 特征版本跟踪
         self._feature_stats = {}  # 特征统计信息（用于填充）
         self.enable_auto_retrain = True
+        self._is_training = False
+        self._auto_retrain_triggered_date = None
+        self._auto_retrain_window_minutes = 60  # UTC 12:00 ±30 分钟
+        self._retrain_check_interval = 60       # 每60秒检测一次
+        self._last_retrain_check_ts = 0.0
 
         # 扩展配置
         self.label_method = os.environ.get('ML_LABEL_METHOD', 'dynamic')  # dynamic | balanced | percentile
         self.use_quantile_decision = os.environ.get('USE_QUANTILE_DECISION', 'true').lower() == 'true'
         self.min_samples_for_quantile = 300
         self.calibration_target_mean = 0.5
-        self.calibration_target_std = 0.15
+        # 收紧目标标准差以避免概率被过度拉伸
+        self.calibration_target_std = 0.08
+        # 限制校准缩放，防止小sigma导致概率塌陷
+        self.calibration_scale_min = 0.5
+        self.calibration_scale_max = 2.0
 
         # 概率历史记录（用于分位数决策）
         import collections
@@ -289,9 +298,14 @@ class AutoGluonRiverStrategy:
             return self.calibration_target_mean
 
         # 使用文档中的校准公式: p_cal = clip((p - μ)σ_t/σ + μ_t, 0, 1)
-        mu_t = self.calibration_target_mean  # 0.5
-        sigma_t = self.calibration_target_std  # 0.15
-        p_cal = (p - mu) * sigma_t / sigma + mu_t
+        mu_t = self.calibration_target_mean
+        sigma_t = self.calibration_target_std
+
+        scale = sigma_t / max(sigma, 1e-6)
+        # 限制缩放倍数，避免将中性概率压得过低或拉得过高
+        scale = float(np.clip(scale, self.calibration_scale_min, self.calibration_scale_max))
+
+        p_cal = (p - mu) * scale + mu_t
 
         return float(np.clip(p_cal, 0, 1))
 
@@ -955,13 +969,64 @@ class AutoGluonRiverStrategy:
                 logger.error(f"{symbol} 信号生成失败: {e}")
                 return None
 
-    def retrain_all_models(self):
+    def retrain_all_models(self) -> bool:
         """重训所有模型"""
         with self._training_lock:
-            logger.info("开始重训所有模型...")
-            for symbol in self.symbols:
+            if self._is_training:
+                logger.warning("模型正在训练中，跳过本次训练请求")
+                return False
+            self._is_training = True
+
+        start_utc = datetime.utcnow()
+        try:
+            logger.info(f"开始重训所有模型 (UTC时间: {start_utc})")
+            for idx, symbol in enumerate(self.symbols, 1):
+                logger.info(f"训练进度: [{idx}/{len(self.symbols)}] 正在训练 {symbol} 模型...")
                 self.train_autogluon_model(symbol)
-            logger.info("模型重训完成")
+                logger.info(f"✓ {symbol} 模型训练完成")
+
+            self._last_retrain_date = datetime.utcnow()
+            self._auto_retrain_triggered_date = self._last_retrain_date.date()
+            logger.info("所有模型重训完成")
+            return True
+        except Exception as e:
+            logger.error(f"模型重训失败: {e}")
+            return False
+        finally:
+            with self._training_lock:
+                self._is_training = False
+
+    def check_and_auto_retrain(self):
+        """检测是否需要在UTC 12:00附近自动重训"""
+        if not self.enable_auto_retrain:
+            return
+
+        now_utc = datetime.utcnow()
+
+        # 今日已触发，跳过
+        if self._auto_retrain_triggered_date == now_utc.date():
+            return
+
+        # 计算窗口：UTC 12:00 ± window/2
+        target_utc = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+        window_half_seconds = (self._auto_retrain_window_minutes / 2) * 60
+        if abs((now_utc - target_utc).total_seconds()) > window_half_seconds:
+            return
+
+        if self._is_training:
+            logger.debug("自动重训练窗口内但模型仍在训练中，跳过本次检查")
+            return
+
+        logger.info(f"触发自动重训练 (UTC: {now_utc}, Local: {datetime.now()})")
+        self._auto_retrain_triggered_date = now_utc.date()
+
+        def _run():
+            success = self.retrain_all_models()
+            if not success:
+                logger.warning("自动重训练失败，将允许稍后重试")
+                self._auto_retrain_triggered_date = None
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def force_download_all_hourly_data(self):
         """强制重新下载所有币种的历史数据"""
@@ -1147,8 +1212,15 @@ def main():
 
         # 在后台线程运行信号生成
         def generate_signals_loop():
+            last_retrain_check = 0.0
             while True:
                 try:
+                    now_ts = time.time()
+                    if now_ts - last_retrain_check >= strategy._retrain_check_interval:
+                        strategy.check_and_auto_retrain()
+                        strategy._last_retrain_check_ts = now_ts
+                        last_retrain_check = now_ts
+
                     # 生成信号
                     signals = strategy.get_all_signals()
 
