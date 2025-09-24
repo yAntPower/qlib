@@ -38,6 +38,7 @@ import logging
 import warnings
 import threading
 import requests
+from backtest_repository import BacktestRepository
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -168,6 +169,16 @@ class EnhancedProductionML:
         self.enable_auto_retrain = enable_auto_retrain
         self._last_retrain_date = None
         
+        default_backtest_dir = os.getenv('QLIB_BACKTEST_DIR')
+        if not default_backtest_dir:
+            file_dir = os.getenv('QLIB_FILE_DIR')
+            if file_dir:
+                default_backtest_dir = os.path.join(file_dir, 'backtests')
+            else:
+                default_backtest_dir = os.path.expanduser('~/.qlib/backtests')
+        refresh_interval = int(os.getenv('QLIB_BACKTEST_REFRESH_INTERVAL', os.getenv('BACKTEST_REFRESH_INTERVAL', '300')))
+        self.backtest_repo = BacktestRepository(default_backtest_dir, refresh_interval=refresh_interval)
+
         # 参数配置 - 从环境变量读取
         ml_env = os.getenv('ML_ENVIRONMENT', 'production')
         
@@ -1809,7 +1820,40 @@ class EnhancedProductionML:
                 logger.warning(f"  ✗ {symbol} 数据更新失败: {e}")
         
         logger.info("批量数据更新完成")
-    
+
+    def _apply_backtest_feedback(self, symbol: str, signal: Dict) -> Dict:
+        if not getattr(self, 'backtest_repo', None):
+            return signal
+
+        record = self.backtest_repo.get_latest(symbol)
+        if not record:
+            return signal
+
+        backtest_meta = self.backtest_repo.as_dict(record)
+        signal.setdefault('metadata', {})
+        signal['metadata']['backtest'] = backtest_meta
+        signal.setdefault('risk_metrics', {})['backtest_quality'] = backtest_meta['quality']
+
+        quality = backtest_meta['quality']
+        adjustment = 'referenced'
+
+        if quality == 'weak':
+            original = signal.get('recommendation')
+            signal['confidence'] = min(signal['confidence'], 0.45)
+            if original != 'HOLD':
+                signal['recommendation'] = 'HOLD'
+                signal['metadata']['backtest']['original_recommendation'] = original
+                adjustment = f'downgraded_from_{original}'
+            else:
+                adjustment = 'confidence_capped'
+        elif quality == 'strong':
+            signal['confidence'] = min(0.99, signal['confidence'] * 1.08)
+            adjustment = 'boosted_confidence'
+
+        signal['metadata']['backtest']['action'] = adjustment
+        signal['metadata']['backtest']['timestamp'] = backtest_meta['generated_at']
+        return signal
+
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """生成交易信号（带锁保护，训练时暂停）"""
         # 更新情绪数据
@@ -2049,7 +2093,9 @@ class EnhancedProductionML:
                 'model_metrics': self.model_metrics.get(symbol, {}),
                 'sentiment': self.sentiment_data
             }
-            
+
+            signal = self._apply_backtest_feedback(symbol, signal)
+
             # 执行纸上交易
             paper_result = self.paper_trade(signal)
             signal['paper_trade'] = paper_result

@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from loguru import logger
 import time
 import argparse
+from backtest_repository import BacktestRepository
 
 warnings.filterwarnings('ignore')
 
@@ -132,6 +133,16 @@ class AutoGluonRiverStrategy:
         # 概率历史记录（用于分位数决策）
         import collections
         self._prob_history = {s: collections.deque(maxlen=2000) for s in self.symbols}
+
+        backtest_dir = os.getenv('QLIB_BACKTEST_DIR')
+        if not backtest_dir:
+            file_dir = os.getenv('QLIB_FILE_DIR')
+            if file_dir:
+                backtest_dir = os.path.join(file_dir, 'backtests')
+            else:
+                backtest_dir = os.path.expanduser('~/.qlib/backtests')
+        refresh_interval = int(os.getenv('QLIB_BACKTEST_REFRESH_INTERVAL', os.getenv('BACKTEST_REFRESH_INTERVAL', '300')))
+        self.backtest_repo = BacktestRepository(backtest_dir, refresh_interval=refresh_interval)
 
         logger.info(f"策略初始化: lookforward={self.lookforward}, warmup={self.warmup}")
 
@@ -783,6 +794,43 @@ class AutoGluonRiverStrategy:
                     self._save_river_model(symbol)
                     info['updates_since_save'] = 0
 
+    def _apply_backtest_feedback(self, symbol: str, signal: Dict) -> Dict:
+        repository = getattr(self, 'backtest_repo', None)
+        if not repository:
+            return signal
+
+        record = repository.get_latest(symbol)
+        if not record:
+            return signal
+
+        backtest_meta = repository.as_dict(record)
+        signal.setdefault('metadata', {})
+        signal['metadata']['backtest'] = backtest_meta
+        signal.setdefault('risk_metrics', {})
+        signal['risk_metrics']['backtest_quality'] = backtest_meta['quality']
+
+        quality = backtest_meta['quality']
+        adjustment = 'referenced'
+
+        if quality == 'weak':
+            prev = signal.get('recommendation')
+            signal['confidence'] = min(signal.get('confidence', 0.0), 0.45)
+            if prev and prev.upper() != 'HOLD':
+                signal['metadata']['backtest']['original_recommendation'] = prev
+                signal['recommendation'] = 'HOLD'
+                signal['type'] = 'hold'
+                adjustment = f'downgraded_from_{prev}'
+            else:
+                adjustment = 'confidence_capped'
+        elif quality == 'strong':
+            signal['confidence'] = min(0.99, signal.get('confidence', 0.0) * 1.08)
+            adjustment = 'boosted_confidence'
+
+        signal['metadata']['backtest']['action'] = adjustment
+        signal['metadata']['backtest']['timestamp'] = backtest_meta['generated_at']
+        logger.debug(f"Backtest feedback applied to {symbol}: quality={quality}, action={adjustment}")
+        return signal
+
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """生成交易信号（修正版）"""
         start_time = time.time()
@@ -944,7 +992,7 @@ class AutoGluonRiverStrategy:
                 elapsed = time.time() - start_time
                 logger.debug(f"{symbol} 信号生成耗时: {elapsed:.3f}秒")
 
-                return {
+                signal = {
                     'symbol': symbol,
                     'type': rec.lower(),
                     'recommendation': rec,
@@ -964,6 +1012,9 @@ class AutoGluonRiverStrategy:
                     } if meta.get('mode') == 'quantile' else None,
                     'source': 'autogluon_river_fixed'
                 }
+
+                signal = self._apply_backtest_feedback(symbol, signal)
+                return signal
 
             except Exception as e:
                 logger.error(f"{symbol} 信号生成失败: {e}")
