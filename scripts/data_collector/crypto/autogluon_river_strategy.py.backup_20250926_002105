@@ -356,27 +356,17 @@ class AutoGluonRiverStrategy:
 
             return rec, confidence, {'mode': 'fallback_median', 'median': median}
 
-        # 使用改进的分位数决策（q10/q50/q90）
+        # 使用分位数决策
         arr = np.array(hist)
-        q10, q25, q50, q75, q90 = np.quantile(arr, [0.1, 0.25, 0.5, 0.75, 0.9])
-
-        # 使用q10-q90作为主要span，更不容易饱和
-        span = q90 - q10
-        inner_span = q75 - q25  # 内部span用于HOLD区间
-
-        # 配置参数（可通过环境变量覆盖）
-        temperature = float(os.getenv('ML_CONF_TEMPERATURE', '2.0'))  # 温度参数，>1降低置信度
-        max_confidence = float(os.getenv('ML_MAX_CONFIDENCE', '0.85'))  # 最大置信度上限
+        q20, q50, q80 = np.quantile(arr, [0.2, 0.5, 0.8])
+        span = q80 - q20
 
         # Span退化检测：分布过窄时回退到中位数逻辑
-        if span < 0.02 or inner_span < 0.01:
+        if span < 0.01:
             # 视为信息不足：回退到中位数逻辑
             median = q50
-            distance = abs(p - median)
-            # 使用sigmoid平滑
-            raw_conf = distance / max(inner_span, 0.01)
-            confidence = 1 / (1 + np.exp(-4 * (raw_conf - 0.5)))  # sigmoid with slope 4
-            confidence = min(confidence * 0.7, max_confidence)  # 降低退化模式的置信度
+            iqr = max(q80 - q20, 1e-6)
+            confidence = float(np.clip(abs(p - median) / (iqr / 2), 0, 1))
 
             if confidence < self.dead_zone:
                 return 'HOLD', confidence, {'mode': 'quantile_fallback', 'reason': 'span_collapse', 'median': median, 'span': span}
@@ -388,70 +378,40 @@ class AutoGluonRiverStrategy:
 
             return rec, confidence, {'mode': 'quantile_fallback', 'median': median, 'span': span}
 
-        # 正常span情况 - 使用sigmoid平滑映射
-        def sigmoid_confidence(distance, scale):
-            """使用sigmoid函数平滑映射置信度"""
-            # distance: 距离阈值的距离
-            # scale: 归一化尺度
-            normalized = distance / scale
-            # 使用tanh函数，更平滑的饱和
-            raw = np.tanh(normalized * 1.5)  # 1.5控制上升速度
-            # 映射到[0.5, 1]区间
-            return 0.5 + 0.5 * raw
+        # 正常span情况
+        span = max(span, 1e-6)  # 防止除零
 
-        # 改进的信号判定逻辑
-        if p > q90:
+        if p > q80:
             rec = 'BUY'
-            # 超出q90的距离，使用sigmoid映射
-            distance = p - q90
-            confidence = sigmoid_confidence(distance, span * 0.2)  # 使用20% span作为scale
-        elif p < q10:
+            # 距离q80往上推进的幅度，相对span缩放到[0.5,1]
+            confidence = 0.5 + 0.5 * min((p - q80) / span, 1.0)
+        elif p < q20:
             rec = 'SELL'
-            # 低于q10的距离，使用sigmoid映射
-            distance = q10 - p
-            confidence = sigmoid_confidence(distance, span * 0.2)
-        elif p > q75:
-            # q75-q90区间：弱BUY倾向
-            rec = 'BUY'
-            distance = p - q75
-            confidence = 0.45 + 0.1 * (distance / (q90 - q75))  # 0.45-0.55
-        elif p < q25:
-            # q10-q25区间：弱SELL倾向
-            rec = 'SELL'
-            distance = q25 - p
-            confidence = 0.45 + 0.1 * (distance / (q25 - q10))  # 0.45-0.55
+            # 距离q20往下推进的幅度，相对span缩放到[0.5,1]
+            confidence = 0.5 + 0.5 * min((q20 - p) / span, 1.0)
         else:
-            # q25-q75中间区间：HOLD
             rec = 'HOLD'
-            # HOLD区间使用到中位数的距离
-            distance = abs(p - q50)
-            confidence = min(distance / (inner_span / 2), 0.4)  # 最大0.4
+            # HOLD区间内，使用到中位数的距离，相对半span归一化
+            confidence = abs(p - q50) / (span / 2)
+            # 可选：限制HOLD置信度上限，避免过度自信
+            confidence = min(confidence, 0.6)
 
-        # 应用温度缩放（降低过度自信）
-        if rec != 'HOLD':
-            confidence = confidence ** (1 / temperature)
-
-        # 应用置信度上限
-        confidence = float(np.clip(confidence, 0, max_confidence))
+        confidence = float(np.clip(confidence, 0, 1))
 
         # 统一过滤：对BUY/SELL应用min_confidence和dead_zone
         if rec != 'HOLD':
             if confidence < self.dead_zone:
-                return 'HOLD', confidence, {'mode': 'quantile_v2', 'reason': 'dead_zone', 'q10': float(q10), 'q90': float(q90), 'p': float(p)}
+                return 'HOLD', confidence, {'mode': 'quantile', 'reason': 'dead_zone', 'q20': float(q20), 'q80': float(q80), 'p': float(p)}
             if confidence < self.min_confidence:
-                return 'HOLD', confidence, {'mode': 'quantile_v2', 'reason': 'min_conf', 'q10': float(q10), 'q90': float(q90), 'p': float(p)}
+                return 'HOLD', confidence, {'mode': 'quantile', 'reason': 'min_conf', 'q20': float(q20), 'q80': float(q80), 'p': float(p)}
 
         return rec, confidence, {
-            'mode': 'quantile_v2',
-            'q10': float(q10),
-            'q25': float(q25),
+            'mode': 'quantile',
+            'q20': float(q20),
             'q50': float(q50),
-            'q75': float(q75),
-            'q90': float(q90),
+            'q80': float(q80),
             'p': float(p),
-            'span': float(span),
-            'temperature': temperature,
-            'max_conf': max_confidence
+            'span': float(span)
         }
 
     def _save_river_model(self, symbol: str):
@@ -1029,8 +989,6 @@ class AutoGluonRiverStrategy:
                 else:
                     if meta['mode'] == 'quantile':
                         reason = f"{rec} | raw={raw_buy_prob:.3f} cal={calibrated_prob:.3f} (q20={meta['q20']:.3f}, q80={meta['q80']:.3f})"
-                    elif meta['mode'] == 'quantile_v2':
-                        reason = f"{rec} | raw={raw_buy_prob:.3f} cal={calibrated_prob:.3f} (q10={meta['q10']:.3f}, q90={meta['q90']:.3f})"
                     else:
                         reason = f"{rec} | raw={raw_buy_prob:.3f} cal={calibrated_prob:.3f} ({meta['mode']})"
 

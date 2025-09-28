@@ -373,6 +373,95 @@ ml.retrain_all_models()
 - **Download batch size**: 1000 records per API call
 - **Complete download time**: ~2-3 minutes per symbol
 
+## 2025-09-25 信号记录和分析系统
+
+### JSONL信号记录功能
+AutoGluon+River策略现已集成自动信号记录功能，所有生成的交易信号会自动保存到JSONL文件。
+
+#### 实现细节
+- **存储路径**: `~/.qlib/signal_logs/`
+- **文件命名**: `signals_YYYYMMDD.jsonl`（按日期自动轮转）
+- **记录内容**: 所有信号（包括HOLD），含完整元数据
+- **线程安全**: 使用锁机制确保并发写入安全
+- **自动启用**: 无需额外配置，策略启动后自动记录
+
+#### 记录的数据字段
+```json
+{
+  "symbol": "BTCUSDT",
+  "type": "long/short/hold",
+  "recommendation": "BUY/SELL/HOLD",
+  "confidence": 0.75,
+  "buy_prob": 0.65,
+  "raw_buy_prob": 0.63,
+  "adjusted_prob": 0.64,
+  "price": 42000.5,
+  "models_used": 2,
+  "timestamp": "2025-09-25T12:00:00",
+  "logged_at": "2025-09-25T12:00:01",
+  "reason": "BUY | raw=0.63 cal=0.65 (q20=0.45, q80=0.78)",
+  "decision_mode": "quantile",
+  "quantiles": {"q20": 0.45, "q50": 0.55, "q80": 0.78},
+  "source": "autogluon_river_fixed",
+  "log_type": "realtime_signal"
+}
+```
+
+### 信号分析工具
+新增专门的分析工具 `analyze_signals.py` 用于处理和分析JSONL信号记录。
+
+#### 主要功能
+1. **数据加载**: 批量加载历史信号文件
+2. **统计分析**: 信号分布、置信度统计、币种分析
+3. **模式识别**: 时间模式、连续信号、高置信度信号
+4. **报告生成**: 美观的表格化报告
+5. **回测导出**: 导出标准CSV格式供回测使用
+
+#### 使用示例
+```bash
+# 分析最近7天的信号
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py
+
+# 分析特定日期
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py --date 20250925
+
+# 分析30天数据并生成报告
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py --days 30 --output analysis_report.txt
+
+# 导出CSV用于回测
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py --export signals_for_backtest.csv
+
+# 分析高置信度信号（>0.8）
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py --threshold 0.8
+
+# 指定自定义日志目录
+/home/ant/project/.venv/bin/python3 /home/ant/project/qlib/scripts/data_collector/crypto/analyze_signals.py --dir /path/to/signals
+```
+
+#### 分析报告内容
+- **基本统计**: 总信号数、币种数量、时间范围、平均置信度
+- **信号分布**: BUY/SELL/HOLD的数量和比例
+- **币种统计**: 每个币种的详细信号统计表
+- **高置信度信号**: 筛选并分析置信度超过阈值的信号
+- **时间模式**: 按小时的信号分布，识别活跃时段
+- **连续信号**: 分析同方向连续出现的信号模式
+
+### 应用场景
+1. **策略优化**: 通过分析历史信号改进模型参数
+2. **性能监控**: 跟踪模型表现随时间的变化
+3. **回测验证**: 使用真实历史信号进行回测
+4. **问题诊断**: 调试信号生成逻辑和模型预测
+5. **报告生成**: 为投资决策提供数据支持
+
+### 数据管理建议
+- 信号日志文件会持续增长，建议定期归档旧文件
+- JSONL格式便于流式处理大文件，无需全部加载到内存
+- 可以使用标准UNIX工具（如jq、grep）直接处理JSONL文件
+- 建议保留至少30天的信号记录用于分析
+
+### 新增依赖
+- tabulate 0.9.0 - 用于生成美观的表格报告
+
 ## 生产环境最佳实践要求
 
 ### 核心原则
