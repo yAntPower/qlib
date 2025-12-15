@@ -97,9 +97,9 @@ class AutoGluonRiverStrategy:
         self.feature_columns = {}
 
         # 重要参数
-        self.min_confidence = float(os.environ.get('ML_MIN_CONFIDENCE', '0.55'))
-        self.dead_zone = float(os.environ.get('ML_DEAD_ZONE', '0.05'))
-        self.lookforward = int(os.environ.get('ML_LOOKFORWARD', '6'))  # 减少到6小时，更实际
+        self.min_confidence = float(os.environ.get('ML_MIN_CONFIDENCE', '0.70'))
+        self.dead_zone = float(os.environ.get('ML_DEAD_ZONE', '0.15'))
+        self.lookforward = int(os.environ.get('ML_LOOKFORWARD', '24'))  # 24小时，适合加密货币
         self.warmup = 50
         self.river_save_interval = int(os.environ.get('RIVER_SAVE_INTERVAL', '20'))  # River模型保存间隔
 
@@ -120,7 +120,7 @@ class AutoGluonRiverStrategy:
         self._last_retrain_check_ts = 0.0
 
         # 扩展配置
-        self.label_method = os.environ.get('ML_LABEL_METHOD', 'dynamic')  # dynamic | balanced | percentile
+        self.label_method = os.environ.get('ML_LABEL_METHOD', 'balanced')  # dynamic | balanced | percentile
         self.use_quantile_decision = os.environ.get('USE_QUANTILE_DECISION', 'true').lower() == 'true'
         self.min_samples_for_quantile = 300
         self.calibration_target_mean = 0.5
@@ -302,33 +302,29 @@ class AutoGluonRiverStrategy:
         logger.info(f"创建新的 {symbol} River模型")
 
     def _calibrate_prob(self, symbol: str, p: float) -> float:
-        """线性概率校准 - 基于文档中的公式"""
-        stats = self._feature_stats.get(symbol, {})
-        mu = stats.get('prob_mean')
-        sigma = stats.get('prob_std')
-
-        if mu is None or sigma is None:
-            # 无统计信息时返回原值
-            return p
-
-        if sigma < 5e-4:
-            # 分布塌缩时直接回归目标均值，避免放大量化噪声
-            return self.calibration_target_mean
-
-        # 使用文档中的校准公式: p_cal = clip((p - μ)σ_t/σ + μ_t, 0, 1)
-        mu_t = self.calibration_target_mean
-        sigma_t = self.calibration_target_std
-
-        scale = sigma_t / max(sigma, 1e-6)
-        # 限制缩放倍数，避免将中性概率压得过低或拉得过高
-        scale = float(np.clip(scale, self.calibration_scale_min, self.calibration_scale_max))
-
-        p_cal = (p - mu) * scale + mu_t
-
-        return float(np.clip(p_cal, 0, 1))
+        """概率校准 - 已禁用，直接返回原始概率"""
+        # 概率校准会扭曲模型的真实判断
+        # 让模型自己说话，不要人为干预
+        return p
 
     def _decision_from_quantiles(self, symbol: str, p: float) -> tuple:
-        """基于历史分位数的决策（替代固定0.5）"""
+        """简化的决策逻辑（基于固定阈值）"""
+        # 简单明确的决策规则
+        # BUY: p > 0.65
+        # SELL: p < 0.35
+        # HOLD: 0.35 <= p <= 0.65
+
+        if p > 0.65:
+            confidence = (p - 0.5) * 2  # 0.65 -> 0.3, 1.0 -> 1.0
+            return 'BUY', float(np.clip(confidence, 0, 1)), {'mode': 'simple_threshold', 'p': float(p)}
+        elif p < 0.35:
+            confidence = (0.5 - p) * 2  # 0.35 -> 0.3, 0.0 -> 1.0
+            return 'SELL', float(np.clip(confidence, 0, 1)), {'mode': 'simple_threshold', 'p': float(p)}
+        else:
+            return 'HOLD', 0.0, {'mode': 'simple_threshold', 'reason': 'dead_zone', 'p': float(p)}
+
+    def _decision_from_quantiles_old(self, symbol: str, p: float) -> tuple:
+        """原始的分位数决策逻辑（已弃用）"""
         hist = self._prob_history[symbol]
 
         if len(hist) < self.min_samples_for_quantile or not self.use_quantile_decision:
@@ -465,7 +461,7 @@ class AutoGluonRiverStrategy:
             logger.warning(f"{symbol} River模型保存失败: {e}")
 
     def _load_data(self, symbol: str) -> pd.DataFrame:
-        """加载数据"""
+        """加载数据（修复：处理时间缺口）"""
         try:
             file_path = os.path.join(self.data_dir, f"{symbol}.csv")
             if not os.path.exists(file_path):
@@ -481,8 +477,18 @@ class AutoGluonRiverStrategy:
             # 重新加载
             df = pd.read_csv(file_path)
             df['date'] = pd.to_datetime(df['date'], utc=True)  # 显式指定UTC
+            df = df.sort_values('date').reset_index(drop=True)
 
-            return df.sort_values('date').reset_index(drop=True)
+            # 处理时间缺口：重采样并线性插值
+            df = df.set_index('date')
+            df = df.resample('1H').asfreq()  # 重采样为每小时
+            # 只对price和volume插值，避免产生不合理的数据
+            df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].interpolate(method='linear', limit=5)
+            df['volume'] = df['volume'].fillna(0)  # 缺失的成交量填0
+            df = df.dropna(subset=['close'])  # 删除无法插值的行
+            df = df.reset_index()
+
+            return df
 
         except Exception as e:
             logger.error(f"加载 {symbol} 数据失败: {e}")
@@ -597,11 +603,12 @@ class AutoGluonRiverStrategy:
         close = df['close']
         vol = df['volume']
 
-        # 价格特征
+        # 价格特征（修复：使用历史数据，避免前视偏差）
         f['ret_1'] = close.pct_change()
         f['log_ret_1'] = np.log(close / close.shift(1))
-        f['high_low_pct'] = (df['high'] - df['low']) / close
-        f['close_open_pct'] = (close - df['open']) / df['open']
+        # 使用前一根K线的数据，避免使用当前未完成K线
+        f['prev_high_low_pct'] = (df['high'].shift(1) - df['low'].shift(1)) / close.shift(1)
+        f['prev_close_open_pct'] = (close.shift(1) - df['open'].shift(1)) / df['open'].shift(1)
 
         # 移动平均
         for w in [5, 10, 20, 50]:
